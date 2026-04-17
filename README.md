@@ -1,4 +1,4 @@
-# @promptreports/cli
+# @promptreports-cli
 
 **Vibe Coding Infrastructure Optimizer** — Track, optimize, and reduce AI coding costs across Claude Code, Cursor, Copilot, and 90+ services.
 
