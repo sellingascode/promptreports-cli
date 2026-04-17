@@ -1,0 +1,55 @@
+{
+  "name": "promptreports-cli",
+  "version": "1.0.0",
+  "description": "Vibe Coding Infrastructure Optimizer — track, optimize, and reduce AI coding costs across Claude Code, Cursor, Copilot, and 90+ services",
+  "license": "MIT",
+  "author": "PromptReports.ai <hello@promptreports.ai>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sellingascode/promptreports-cli"
+  },
+  "homepage": "https://promptreports.ai",
+  "bugs": {
+    "url": "https://github.com/sellingascode/promptreports-cli/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "cursor",
+    "copilot",
+    "ai-costs",
+    "token-tracker",
+    "vibe-coding",
+    "finops",
+    "llm-optimization",
+    "developer-tools",
+    "ai-observability"
+  ],
+  "bin": {
+    "promptreports": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/",
+    "skills/",
+    "templates/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "test": "node --test src/**/*.test.ts",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  },
+  "dependencies": {}
+}
