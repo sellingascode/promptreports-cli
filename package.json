@@ -1,7 +1,7 @@
 {
   "name": "promptreports-cli",
-  "version": "1.0.0",
-  "description": "Vibe Coding Infrastructure Optimizer — track, optimize, and reduce AI coding costs across Claude Code, Cursor, Copilot, and 90+ services",
+  "version": "1.1.0",
+  "description": "Vibe Coder Toolkit — 22 developer tools for AI cost tracking, environment sync, codebase analysis, session replay, and ops intelligence across Claude Code, Cursor, Copilot, and 90+ services",
   "license": "MIT",
   "author": "PromptReports.ai <hello@promptreports.ai>",
   "repository": {
@@ -22,7 +22,15 @@
     "finops",
     "llm-optimization",
     "developer-tools",
-    "ai-observability"
+    "ai-observability",
+    "env-sync",
+    "context-window",
+    "prompt-drift",
+    "dead-code",
+    "session-replay",
+    "schema-drift",
+    "git-intelligence",
+    "cost-attribution"
   ],
   "bin": {
     "promptreports": "./dist/cli.js"

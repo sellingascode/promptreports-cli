@@ -3,3 +3,4 @@ dist/
 *.tgz
 .promptreports/
 .env*
+npm_recovery_codes.txt
