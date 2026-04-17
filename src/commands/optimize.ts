@@ -7,6 +7,13 @@ import * as path from 'node:path';
 import { scanClaudeSessions, type SessionStats } from '../scanners/claude-sessions.js';
 import { discoverFromProject } from '../scanners/env-discovery.js';
 
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return n.toLocaleString();
+}
+
 export async function optimize(args: string[]): Promise<void> {
   const daysIdx = args.indexOf('--days');
   const days = daysIdx >= 0 ? parseInt(args[daysIdx + 1]) || 7 : 7;
@@ -23,32 +30,54 @@ export async function optimize(args: string[]): Promise<void> {
     return;
   }
 
-  const recs: Array<{ title: string; savings: number; effort: string; desc: string }> = [];
+  // Compute period totals for context
+  const periodCost = sessions.reduce((s, st) => s + st.estimatedCostUsd, 0);
+  const periodTokens = sessions.reduce((s, st) => s + st.totalTokens, 0);
+  const totalTurns = sessions.reduce((sum, s) => sum + s.turns.length, 0);
+  const monthlyCost = Math.round(periodCost * 30 / days);
+
+  // Show current spend as context
+  console.log('┌─────────────────────────────────────────────────────────────┐');
+  console.log(`│  YOUR ${days}-DAY SPEND`.padEnd(62) + '│');
+  console.log('├─────────────────────────────────────────────────────────────┤');
+  console.log(`│  Cost:     $${periodCost.toFixed(2)}  (${fmtTokens(periodTokens)} tokens)`.padEnd(62) + '│');
+  console.log(`│  Turns:    ${fmtTokens(totalTurns)}  across ${sessions.length} sessions`.padEnd(62) + '│');
+  console.log(`│  Run rate: ~$${monthlyCost}/mo`.padEnd(62) + '│');
+  console.log('└─────────────────────────────────────────────────────────────┘');
+  console.log('');
+
+  const recs: Array<{ title: string; savings: number; effort: string; desc: string; spent: number; tokens: number }> = [];
 
   // 1. Long sessions — based on actual session data
   const longSessions = sessions.filter(s => s.messageCount > 20);
   if (longSessions.length > 0) {
-    const avgWasted = longSessions.reduce((sum, s) => sum + s.estimatedCostUsd * 0.3, 0);
-    const monthlySavings = Math.max(10, Math.round(avgWasted * 30 / days));
+    const longCost = longSessions.reduce((sum, s) => sum + s.estimatedCostUsd, 0);
+    const longTokens = longSessions.reduce((sum, s) => sum + s.totalTokens, 0);
+    const wastedCost = longCost * 0.3; // ~30% wasted on context re-reads
+    const monthlySavings = Math.max(10, Math.round(wastedCost * 30 / days));
     recs.push({
       title: 'Restart sessions at message 20',
       savings: monthlySavings,
       effort: 'low',
+      spent: longCost,
+      tokens: longTokens,
       desc: `${longSessions.length} sessions exceeded 20 messages — context bloat wastes tokens on re-reads`
     });
   }
 
   // 2. Model mix — based on actual turn data
   const opusTurns = sessions.reduce((sum, s) => sum + s.turns.filter(t => t.model?.includes('opus')).length, 0);
-  const totalTurns = sessions.reduce((sum, s) => sum + s.turns.length, 0);
   const opusPercent = totalTurns > 0 ? (opusTurns / totalTurns) * 100 : 0;
   if (opusPercent > 70) {
     const opusCost = sessions.reduce((sum, s) => sum + s.turns.filter(t => t.model?.includes('opus')).reduce((a, t) => a + t.costUsd, 0), 0);
+    const opusTokens = sessions.reduce((sum, s) => sum + s.turns.filter(t => t.model?.includes('opus')).reduce((a, t) => a + t.totalTokens, 0), 0);
     const potentialSavings = Math.max(20, Math.round(opusCost * 0.4 * 30 / days));
     recs.push({
       title: 'Use /fast for simple tasks',
       savings: potentialSavings,
       effort: 'low',
+      spent: opusCost,
+      tokens: opusTokens,
       desc: `${Math.round(opusPercent)}% of turns use Opus — simple tasks (git, grep, formatting) should use /fast`
     });
   }
@@ -62,6 +91,8 @@ export async function optimize(args: string[]): Promise<void> {
         title: `Trim CLAUDE.md (${words.toLocaleString()} → 2,000 words)`,
         savings: 42,
         effort: 'medium',
+        spent: 0,
+        tokens: 0,
         desc: 'CLAUDE.md loads every message — large files cost tokens on every turn'
       });
     }
@@ -79,6 +110,8 @@ export async function optimize(args: string[]): Promise<void> {
           title: `Review ${dirs.length} installed skills`,
           savings: 15,
           effort: 'low',
+          spent: 0,
+          tokens: 0,
           desc: 'Each skill increases context size — remove unused skills to save tokens'
         });
       }
@@ -95,6 +128,8 @@ export async function optimize(args: string[]): Promise<void> {
       title: `Consolidate ${searchServices.length} search APIs (${searchServices.map(s => s.name).join(', ')})`,
       savings: 18,
       effort: 'low',
+      spent: 0,
+      tokens: 0,
       desc: 'Multiple search APIs serve the same purpose — consolidate to reduce duplicate costs'
     });
   }
@@ -106,6 +141,8 @@ export async function optimize(args: string[]): Promise<void> {
       title: 'Improve cache hit rate',
       savings: 23,
       effort: 'medium',
+      spent: 0,
+      tokens: 0,
       desc: `Current avg cache hit: ${Math.round(avgCacheHit)}% — use consistent prompt structures and shorter sessions`
     });
   }
@@ -120,13 +157,20 @@ export async function optimize(args: string[]): Promise<void> {
   for (const rec of recs) {
     totalSavings += rec.savings;
     const icon = rec.effort === 'low' ? '✓' : '◐';
+    const context = rec.spent > 0
+      ? `  (spent $${rec.spent.toFixed(2)} on ${fmtTokens(rec.tokens)} tokens this period)`
+      : '';
     console.log(`  ${icon}  -$${rec.savings}/mo  ${rec.title}`);
     console.log(`     ${rec.desc}`);
+    if (context) console.log(`    ${context}`);
     console.log('');
   }
 
+  const savingsPercent = monthlyCost > 0 ? Math.round((totalSavings / monthlyCost) * 100) : 0;
   console.log('┌─────────────────────────────────────────────────────────────┐');
-  console.log(`│  TOTAL POTENTIAL SAVINGS:  $${totalSavings}/mo`.padEnd(62) + '│');
+  console.log(`│  CURRENT RUN RATE:        ~$${monthlyCost}/mo`.padEnd(62) + '│');
+  console.log(`│  POTENTIAL SAVINGS:        -$${totalSavings}/mo (${savingsPercent}%)`.padEnd(62) + '│');
+  console.log(`│  OPTIMIZED RUN RATE:      ~$${Math.max(0, monthlyCost - totalSavings)}/mo`.padEnd(62) + '│');
   console.log('└─────────────────────────────────────────────────────────────┘');
   console.log('');
   console.log('  Push to dashboard for tracking: npx promptreports push');
