@@ -5,6 +5,9 @@
 import type { SessionStats } from '../scanners/claude-sessions.js';
 
 function fmt(n: number): string {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
   return n.toLocaleString();
 }
 
@@ -25,9 +28,10 @@ export function printTerminalSummary(
   console.log(`│  Sessions:    ${sessions.length}`.padEnd(62) + '│');
   console.log(`│  Turns:       ${fmt(totalTurns)}`.padEnd(62) + '│');
   console.log(`│  Tokens:      ${fmt(totalTokens)}`.padEnd(62) + '│');
+  console.log(`│  ├─ Input:    ${fmt(totalInput)}`.padEnd(62) + '│');
+  console.log(`│  └─ Output:   ${fmt(totalOutput)}`.padEnd(62) + '│');
+  console.log(`│  Cache Hit:   ${Math.min(avgCacheHit, 100).toFixed(1)}%`.padEnd(62) + '│');
   console.log(`│  Est. Cost:   $${totalCost.toFixed(2)}`.padEnd(62) + '│');
-  console.log(`│  Cache Hit:   ${avgCacheHit.toFixed(1)}%`.padEnd(62) + '│');
-  console.log(`│  Input:       ${fmt(totalInput)}  Output: ${fmt(totalOutput)}`.padEnd(62) + '│');
   console.log('└─────────────────────────────────────────────────────────────┘');
 
   // Top consumers
@@ -36,7 +40,8 @@ export function printTerminalSummary(
     console.log('  Top sessions by cost:');
     for (const s of sessions.slice(0, 5)) {
       const pct = totalCost > 0 ? ((s.estimatedCostUsd / totalCost) * 100).toFixed(0) : '0';
-      console.log(`    ${s.sessionId.slice(0, 20).padEnd(22)} $${s.estimatedCostUsd.toFixed(2).padEnd(8)} ${pct}%  ${s.messageCount} msgs`);
+      const date = s.startTime ? new Date(s.startTime).toLocaleDateString() : '';
+      console.log(`    ${date.padEnd(12)} $${s.estimatedCostUsd.toFixed(2).padEnd(10)} ${pct.padStart(3)}%  ${s.messageCount} msgs`);
     }
   }
 

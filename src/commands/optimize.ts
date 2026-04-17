@@ -5,6 +5,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { scanClaudeSessions, type SessionStats } from '../scanners/claude-sessions.js';
+import { discoverFromProject } from '../scanners/env-discovery.js';
 
 export async function optimize(args: string[]): Promise<void> {
   const daysIdx = args.indexOf('--days');
@@ -24,30 +25,35 @@ export async function optimize(args: string[]): Promise<void> {
 
   const recs: Array<{ title: string; savings: number; effort: string; desc: string }> = [];
 
-  // 1. Long sessions
+  // 1. Long sessions — based on actual session data
   const longSessions = sessions.filter(s => s.messageCount > 20);
   if (longSessions.length > 0) {
+    const avgWasted = longSessions.reduce((sum, s) => sum + s.estimatedCostUsd * 0.3, 0);
+    const monthlySavings = Math.max(10, Math.round(avgWasted * 30 / days));
     recs.push({
       title: 'Restart sessions at message 20',
-      savings: 67,
+      savings: monthlySavings,
       effort: 'low',
-      desc: `${longSessions.length} sessions exceeded 20 messages — context bloat wastes tokens`
+      desc: `${longSessions.length} sessions exceeded 20 messages — context bloat wastes tokens on re-reads`
     });
   }
 
-  // 2. Model mix
+  // 2. Model mix — based on actual turn data
   const opusTurns = sessions.reduce((sum, s) => sum + s.turns.filter(t => t.model?.includes('opus')).length, 0);
   const totalTurns = sessions.reduce((sum, s) => sum + s.turns.length, 0);
-  if (totalTurns > 0 && (opusTurns / totalTurns) > 0.7) {
+  const opusPercent = totalTurns > 0 ? (opusTurns / totalTurns) * 100 : 0;
+  if (opusPercent > 70) {
+    const opusCost = sessions.reduce((sum, s) => sum + s.turns.filter(t => t.model?.includes('opus')).reduce((a, t) => a + t.costUsd, 0), 0);
+    const potentialSavings = Math.max(20, Math.round(opusCost * 0.4 * 30 / days));
     recs.push({
       title: 'Use /fast for simple tasks',
-      savings: 128,
+      savings: potentialSavings,
       effort: 'low',
-      desc: `${Math.round((opusTurns / totalTurns) * 100)}% Opus usage — simple tasks should use /fast`
+      desc: `${Math.round(opusPercent)}% of turns use Opus — simple tasks (git, grep, formatting) should use /fast`
     });
   }
 
-  // 3. CLAUDE.md size
+  // 3. CLAUDE.md size — based on actual file in cwd
   const claudeMd = path.join(process.cwd(), 'CLAUDE.md');
   if (fs.existsSync(claudeMd)) {
     const words = fs.readFileSync(claudeMd, 'utf-8').split(/\s+/).length;
@@ -61,7 +67,7 @@ export async function optimize(args: string[]): Promise<void> {
     }
   }
 
-  // 4. Skills count
+  // 4. Skills count — based on actual installed skills
   const skillsDir = path.join(process.cwd(), '.claude', 'skills');
   if (fs.existsSync(skillsDir)) {
     try {
@@ -79,20 +85,36 @@ export async function optimize(args: string[]): Promise<void> {
     } catch {}
   }
 
-  // Always add general recs
-  recs.push({
-    title: 'Consolidate search APIs',
-    savings: 18,
-    effort: 'low',
-    desc: 'If using both Serper and Tavily, consolidate to one'
-  });
+  // 5. Duplicate search APIs — based on actual .env.local
+  const discovery = discoverFromProject(process.cwd());
+  const searchServices = discovery.configured.filter(s =>
+    ['serper', 'tavily', 'exa', 'serpapi'].includes(s.id)
+  );
+  if (searchServices.length > 1) {
+    recs.push({
+      title: `Consolidate ${searchServices.length} search APIs (${searchServices.map(s => s.name).join(', ')})`,
+      savings: 18,
+      effort: 'low',
+      desc: 'Multiple search APIs serve the same purpose — consolidate to reduce duplicate costs'
+    });
+  }
 
-  recs.push({
-    title: 'Cache frequently-used API responses',
-    savings: 23,
-    effort: 'medium',
-    desc: 'Add caching to high-frequency API routes to reduce compute costs'
-  });
+  // 6. Cache hit rate — based on actual session data
+  const avgCacheHit = sessions.reduce((s, st) => s + st.cacheHitRate, 0) / sessions.length;
+  if (avgCacheHit < 50) {
+    recs.push({
+      title: 'Improve cache hit rate',
+      savings: 23,
+      effort: 'medium',
+      desc: `Current avg cache hit: ${Math.round(avgCacheHit)}% — use consistent prompt structures and shorter sessions`
+    });
+  }
+
+  if (recs.length === 0) {
+    console.log('  Your usage looks efficient! No major optimization opportunities found.');
+    console.log('');
+    return;
+  }
 
   let totalSavings = 0;
   for (const rec of recs) {
@@ -107,6 +129,6 @@ export async function optimize(args: string[]): Promise<void> {
   console.log(`│  TOTAL POTENTIAL SAVINGS:  $${totalSavings}/mo`.padEnd(62) + '│');
   console.log('└─────────────────────────────────────────────────────────────┘');
   console.log('');
-  console.log('  Push to dashboard for tracking: npx @promptreports/cli push');
+  console.log('  Push to dashboard for tracking: npx promptreports push');
   console.log('');
 }

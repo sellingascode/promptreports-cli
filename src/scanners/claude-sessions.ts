@@ -129,10 +129,12 @@ function analyzeSession(entries: any[], sessionId: string, projectPath: string):
 
   const totalInput = turns.reduce((s, t) => s + t.inputTokens, 0);
   const totalOutput = turns.reduce((s, t) => s + t.outputTokens, 0);
+  const totalCacheWrite = turns.reduce((s, t) => s + t.cacheWriteTokens, 0);
   const totalCacheRead = turns.reduce((s, t) => s + t.cacheReadTokens, 0);
   const totalTokens = turns.reduce((s, t) => s + t.totalTokens, 0);
   const totalCost = turns.reduce((s, t) => s + t.costUsd, 0);
-  const cacheHitRate = totalInput > 0 ? (totalCacheRead / totalInput) * 100 : 0;
+  const allInput = totalInput + totalCacheWrite + totalCacheRead;
+  const cacheHitRate = allInput > 0 ? (totalCacheRead / allInput) * 100 : 0;
 
   return {
     sessionId,
