@@ -1,304 +1,192 @@
 /**
- * Models command — Model router tuner
+ * models command — Model router tuner.
+ * Analyzes model usage and suggests cost optimizations.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { scanClaudeSessions, type SessionStats, type TurnRecord } from '../scanners/claude-sessions.js';
-
-// Pricing per 1M tokens (input/output)
-const MODEL_PRICING: Record<string, { input: number; output: number; tier: string }> = {
-  opus:   { input: 15,    output: 75,    tier: 'premium' },
-  sonnet: { input: 3,     output: 15,    tier: 'mid' },
-  haiku:  { input: 0.25,  output: 1.25,  tier: 'fast' },
-};
-
-type TaskCategory = 'search' | 'read' | 'write' | 'complex';
+import type { GlobalFlags } from '../cli';
+import { scanProjectSessions, parseSession, analyzeSession, PRICING, type SessionStats } from '../utils/session-scanner';
+import { colorize, box, table, formatCost, formatTokens, sectionHeader } from '../utils/format';
 
 interface ModelUsage {
   model: string;
-  tier: string;
-  turns: number;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
   cost: number;
-  tasks: Record<TaskCategory, number>;
 }
 
-interface DowngradeRecommendation {
-  from: string;
-  to: string;
-  taskType: TaskCategory;
-  turns: number;
-  currentCost: number;
-  projectedCost: number;
-  savings: number;
+interface DowngradeCandidate {
+  file: string;
+  currentModel: string;
+  recommendedModel: string;
+  reason: string;
+  savingsPerCall: number;
+  confidence: 'high' | 'medium' | 'low';
 }
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
-  return n.toLocaleString();
+// Rough pricing per million tokens for different models
+const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  'opus': { input: 15.0, output: 75.0 },
+  'sonnet': { input: 3.0, output: 15.0 },
+  'haiku': { input: 0.25, output: 1.25 },
+  'gpt-4o': { input: 2.5, output: 10.0 },
+  'gpt-4o-mini': { input: 0.15, output: 0.6 },
+};
+
+function categorizeModel(model: string): string {
+  if (model.includes('opus')) return 'opus';
+  if (model.includes('sonnet')) return 'sonnet';
+  if (model.includes('haiku')) return 'haiku';
+  if (model.includes('gpt-4o-mini')) return 'gpt-4o-mini';
+  if (model.includes('gpt-4')) return 'gpt-4o';
+  return 'other';
 }
 
-function fmtCost(n: number): string {
-  if (n >= 1) return '$' + n.toFixed(2);
-  if (n >= 0.01) return '$' + n.toFixed(3);
-  return '$' + n.toFixed(4);
-}
-
-function getModelTier(model: string | undefined): string {
-  if (!model) return 'unknown';
-  const lower = model.toLowerCase();
-  if (lower.includes('opus')) return 'opus';
-  if (lower.includes('sonnet')) return 'sonnet';
-  if (lower.includes('haiku')) return 'haiku';
-  return 'unknown';
-}
-
-function categorizeTask(turn: TurnRecord): TaskCategory {
+function categorizeTurnTask(turn: any): 'search' | 'read' | 'write' | 'complex' {
   const preview = (turn.userPromptPreview || '').toLowerCase();
+  const types = turn.contentTypes || [];
 
-  // Search tasks: grep, find, search, glob, rg
-  if (/\b(grep|find|search|glob|rg|locate|where is|look for)\b/.test(preview)) {
-    return 'search';
-  }
-
-  // Read tasks: read, cat, show, display, look at, check file
-  if (/\b(read|cat|show me|display|look at|check file|view|what does.*say|contents of)\b/.test(preview)) {
-    return 'read';
-  }
-
-  // Write tasks: edit, write, create, add, update, fix, change, modify, rename
-  if (/\b(edit|write|create|add|update|fix|change|modify|rename|replace|insert|delete|remove)\b/.test(preview)) {
-    return 'write';
-  }
-
-  // Default: complex (architecture, debugging, multi-step, planning)
+  if (preview.includes('grep') || preview.includes('search') || preview.includes('find') || preview.includes('glob')) return 'search';
+  if (preview.includes('read') || preview.includes('cat') || preview.includes('show')) return 'read';
+  if (preview.includes('edit') || preview.includes('write') || preview.includes('create') || preview.includes('fix')) return 'write';
   return 'complex';
 }
 
-function calculateTurnCost(turn: TurnRecord, tier: string): number {
-  const pricing = MODEL_PRICING[tier];
-  if (!pricing) return turn.costUsd;
-  return (turn.inputTokens * pricing.input / 1_000_000) + (turn.outputTokens * pricing.output / 1_000_000);
-}
+export async function modelsCommand(flags: GlobalFlags): Promise<void> {
+  const { days, json } = flags;
+  const doOptimize = flags.args.includes('--optimize');
+  const doCompare = flags.args.includes('--compare');
+  const doSavings = flags.args.includes('--savings');
 
-export async function models(args: string[]): Promise<void> {
-  const showJson = args.includes('--json');
-  const daysIdx = args.indexOf('--days');
-  const days = daysIdx >= 0 ? parseInt(args[daysIdx + 1]) || 7 : 7;
+  // Analyze sessions
+  const files = scanProjectSessions(days);
+  const allStats = files.map(f => analyzeSession(parseSession(f), days)).filter(Boolean) as SessionStats[];
 
-  const cwd = process.cwd();
+  // Group by model
+  const modelUsage: Record<string, ModelUsage> = {};
+  const taskDistribution: Record<string, Record<string, number>> = {};
 
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  MODEL ROUTER TUNER                                          ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
+  for (const stats of allStats) {
+    for (const turn of stats.turns) {
+      const model = turn.model || 'unknown';
+      if (!modelUsage[model]) {
+        modelUsage[model] = { model, calls: 0, inputTokens: 0, outputTokens: 0, cost: 0 };
+      }
+      modelUsage[model].calls += 1;
+      modelUsage[model].inputTokens += turn.inputTokens;
+      modelUsage[model].outputTokens += turn.outputTokens;
+      modelUsage[model].cost += turn.costUsd;
 
-  const sessions = scanClaudeSessions(days);
-  if (sessions.length === 0) {
-    console.log('  No Claude Code sessions found. Run some sessions first.');
-    console.log('');
+      // Task categorization
+      const task = categorizeTurnTask(turn);
+      if (!taskDistribution[model]) taskDistribution[model] = {};
+      taskDistribution[model][task] = (taskDistribution[model][task] || 0) + 1;
+    }
+  }
+
+  const sorted = Object.values(modelUsage).sort((a, b) => b.cost - a.cost);
+  const totalCost = sorted.reduce((a, m) => a + m.cost, 0);
+
+  // Calculate potential downgrades
+  const candidates: DowngradeCandidate[] = [];
+  for (const [model, tasks] of Object.entries(taskDistribution)) {
+    const cat = categorizeModel(model);
+    const total = Object.values(tasks).reduce((a, b) => a + b, 0);
+
+    if (cat === 'opus') {
+      const searchPct = (tasks.search || 0) / total;
+      const readPct = (tasks.read || 0) / total;
+
+      if (searchPct > 0.3) {
+        const opusCost = MODEL_PRICING.opus;
+        const sonnetCost = MODEL_PRICING.sonnet;
+        const avgTokens = modelUsage[model].inputTokens / modelUsage[model].calls;
+        const savings = ((avgTokens / 1e6) * (opusCost.input - sonnetCost.input));
+        candidates.push({
+          file: `${Math.round(searchPct * 100)}% of ${model} calls`,
+          currentModel: model,
+          recommendedModel: 'sonnet',
+          reason: 'Search/grep tasks — sonnet handles equally well',
+          savingsPerCall: savings,
+          confidence: 'high',
+        });
+      }
+
+      if (readPct > 0.2) {
+        candidates.push({
+          file: `${Math.round(readPct * 100)}% of ${model} calls`,
+          currentModel: model,
+          recommendedModel: 'haiku',
+          reason: 'Simple file reads — haiku is sufficient',
+          savingsPerCall: 0.01,
+          confidence: 'medium',
+        });
+      }
+    }
+  }
+
+  // Calculate total potential savings
+  let weeklyTaskSavings = 0;
+  for (const c of candidates) {
+    const model = modelUsage[Object.keys(modelUsage).find(m => m.includes(categorizeModel(c.currentModel))) || ''];
+    if (model) {
+      const calls = model.calls * 0.3; // Estimate 30% of calls are downgradable
+      weeklyTaskSavings += c.savingsPerCall * calls;
+    }
+  }
+
+  if (json) {
+    console.log(JSON.stringify({
+      models: sorted,
+      taskDistribution,
+      downgradeCandidates: candidates,
+      totalCost,
+      potentialWeeklySavings: weeklyTaskSavings,
+    }, null, 2));
     return;
   }
 
-  // Group turns by model tier and categorize tasks
-  const usage: Record<string, ModelUsage> = {};
+  // Print usage breakdown
+  sectionHeader('Model Usage');
+  const rows = sorted.map(m => [
+    m.model.slice(0, 30),
+    String(m.calls) + ' calls',
+    formatTokens(m.inputTokens + m.outputTokens),
+    formatCost(m.cost),
+    ((m.cost / Math.max(0.01, totalCost)) * 100).toFixed(0) + '%',
+  ]);
+  if (rows.length > 0) table(['Model', 'Calls', 'Tokens', 'Cost', '%'], rows);
 
-  for (const session of sessions) {
-    for (const turn of session.turns) {
-      const tier = getModelTier(turn.model);
-      if (!usage[tier]) {
-        usage[tier] = {
-          model: turn.model || tier,
-          tier,
-          turns: 0,
-          cost: 0,
-          tasks: { search: 0, read: 0, write: 0, complex: 0 },
-        };
-      }
-      usage[tier].turns++;
-      usage[tier].cost += turn.costUsd;
-
-      const task = categorizeTask(turn);
-      usage[tier].tasks[task]++;
+  // Task distribution
+  if (Object.keys(taskDistribution).length > 0) {
+    sectionHeader('Task Distribution');
+    for (const [model, tasks] of Object.entries(taskDistribution)) {
+      const total = Object.values(tasks).reduce((a, b) => a + b, 0);
+      const parts = Object.entries(tasks)
+        .sort((a, b) => b[1] - a[1])
+        .map(([task, count]) => `${task}: ${Math.round((count / total) * 100)}%`)
+        .join(', ');
+      console.log(`  ${colorize(model.slice(0, 25), 'dim')}: ${parts}`);
     }
   }
 
-  // Display current model usage
-  const totalTurns = Object.values(usage).reduce((s, u) => s + u.turns, 0);
-  const totalCost = Object.values(usage).reduce((s, u) => s + u.cost, 0);
-
-  console.log(`  Analyzing ${totalTurns} turns across ${sessions.length} sessions (${days}-day window)`);
-  console.log('');
-
-  console.log('┌──────────────────────┬────────┬──────────┬─────────┬─────────┬─────────┬─────────┐');
-  console.log('│ Model Tier           │ Turns  │ Cost     │ Search  │ Read    │ Write   │ Complex │');
-  console.log('├──────────────────────┼────────┼──────────┼─────────┼─────────┼─────────┼─────────┤');
-
-  for (const [tier, data] of Object.entries(usage).sort((a, b) => b[1].cost - a[1].cost)) {
-    const pct = totalTurns > 0 ? Math.round((data.turns / totalTurns) * 100) : 0;
-    console.log(
-      '│ ' + (tier + ` (${pct}%)`).padEnd(21) +
-      '│ ' + String(data.turns).padStart(5) + ' ' +
-      '│ ' + fmtCost(data.cost).padStart(7) + ' ' +
-      '│ ' + String(data.tasks.search).padStart(6) + ' ' +
-      '│ ' + String(data.tasks.read).padStart(6) + ' ' +
-      '│ ' + String(data.tasks.write).padStart(6) + ' ' +
-      '│ ' + String(data.tasks.complex).padStart(6) + ' │'
-    );
-  }
-
-  console.log('└──────────────────────┴────────┴──────────┴─────────┴─────────┴─────────┴─────────┘');
-  console.log('');
-
-  // Generate downgrade recommendations
-  const recommendations: DowngradeRecommendation[] = [];
-
-  // Opus search tasks → sonnet
-  const opusUsage = usage['opus'];
-  if (opusUsage && opusUsage.tasks.search > 0) {
-    const searchTurns = sessions.flatMap(s => s.turns).filter(t =>
-      getModelTier(t.model) === 'opus' && categorizeTask(t) === 'search'
-    );
-    const currentCost = searchTurns.reduce((s, t) => s + t.costUsd, 0);
-    const projectedCost = searchTurns.reduce((s, t) => s + calculateTurnCost(t, 'sonnet'), 0);
-    if (currentCost > projectedCost) {
-      recommendations.push({
-        from: 'opus',
-        to: 'sonnet',
-        taskType: 'search',
-        turns: searchTurns.length,
-        currentCost,
-        projectedCost,
-        savings: currentCost - projectedCost,
-      });
-    }
-  }
-
-  // Opus read tasks → haiku
-  if (opusUsage && opusUsage.tasks.read > 0) {
-    const readTurns = sessions.flatMap(s => s.turns).filter(t =>
-      getModelTier(t.model) === 'opus' && categorizeTask(t) === 'read'
-    );
-    const currentCost = readTurns.reduce((s, t) => s + t.costUsd, 0);
-    const projectedCost = readTurns.reduce((s, t) => s + calculateTurnCost(t, 'haiku'), 0);
-    if (currentCost > projectedCost) {
-      recommendations.push({
-        from: 'opus',
-        to: 'haiku',
-        taskType: 'read',
-        turns: readTurns.length,
-        currentCost,
-        projectedCost,
-        savings: currentCost - projectedCost,
-      });
-    }
-  }
-
-  // Sonnet search tasks → haiku
-  const sonnetUsage = usage['sonnet'];
-  if (sonnetUsage && sonnetUsage.tasks.search > 0) {
-    const searchTurns = sessions.flatMap(s => s.turns).filter(t =>
-      getModelTier(t.model) === 'sonnet' && categorizeTask(t) === 'search'
-    );
-    const currentCost = searchTurns.reduce((s, t) => s + t.costUsd, 0);
-    const projectedCost = searchTurns.reduce((s, t) => s + calculateTurnCost(t, 'haiku'), 0);
-    if (currentCost > projectedCost) {
-      recommendations.push({
-        from: 'sonnet',
-        to: 'haiku',
-        taskType: 'search',
-        turns: searchTurns.length,
-        currentCost,
-        projectedCost,
-        savings: currentCost - projectedCost,
-      });
-    }
-  }
-
-  // Sonnet read tasks → haiku
-  if (sonnetUsage && sonnetUsage.tasks.read > 0) {
-    const readTurns = sessions.flatMap(s => s.turns).filter(t =>
-      getModelTier(t.model) === 'sonnet' && categorizeTask(t) === 'read'
-    );
-    const currentCost = readTurns.reduce((s, t) => s + t.costUsd, 0);
-    const projectedCost = readTurns.reduce((s, t) => s + calculateTurnCost(t, 'haiku'), 0);
-    if (currentCost > projectedCost) {
-      recommendations.push({
-        from: 'sonnet',
-        to: 'haiku',
-        taskType: 'read',
-        turns: readTurns.length,
-        currentCost,
-        projectedCost,
-        savings: currentCost - projectedCost,
-      });
-    }
-  }
-
-  // Display recommendations
-  if (recommendations.length > 0) {
-    const totalSavings = recommendations.reduce((s, r) => s + r.savings, 0);
-    const monthlyProjected = totalSavings * 30 / days;
-
-    console.log('  DOWNGRADE RECOMMENDATIONS');
-    console.log('  ─────────────────────────');
-    console.log('');
-
-    for (const rec of recommendations.sort((a, b) => b.savings - a.savings)) {
-      const savingsPct = rec.currentCost > 0 ? Math.round((rec.savings / rec.currentCost) * 100) : 0;
-      console.log(`  → ${rec.from} ${rec.taskType} → ${rec.to}`);
-      console.log(`    ${rec.turns} turns: ${fmtCost(rec.currentCost)} → ${fmtCost(rec.projectedCost)} (save ${fmtCost(rec.savings)}, ${savingsPct}%)`);
+  // Downgrade suggestions
+  if (candidates.length > 0) {
+    sectionHeader('Optimization Suggestions');
+    for (const c of candidates) {
+      console.log(`  ${colorize(c.file, 'bold')}`);
+      console.log(`    ${c.currentModel} → ${colorize(c.recommendedModel, 'green')}`);
+      console.log(`    ${colorize(c.reason, 'dim')}`);
+      console.log(`    Confidence: ${c.confidence === 'high' ? colorize('high', 'green') : colorize(c.confidence, 'yellow')}`);
       console.log('');
     }
 
-    console.log('┌─────────────────────────────────────────────────────────────┐');
-    console.log(`│  CURRENT ${days}-DAY COST:     ${fmtCost(totalCost)}`.padEnd(62) + '│');
-    console.log(`│  PROJECTED SAVINGS:      ${fmtCost(totalSavings)} (${Math.round((totalSavings / totalCost) * 100)}%)`.padEnd(62) + '│');
-    console.log(`│  MONTHLY SAVINGS:       ~${fmtCost(monthlyProjected)}`.padEnd(62) + '│');
-    console.log('└─────────────────────────────────────────────────────────────┘');
-  } else {
-    console.log('  ✓ No downgrade opportunities found — model routing looks optimal');
+    if (weeklyTaskSavings > 0) {
+      console.log(`  ${colorize('Estimated savings:', 'bold')} ${colorize(formatCost(weeklyTaskSavings) + '/week', 'green')} (${formatCost(weeklyTaskSavings * 4)}/month)`);
+    }
   }
 
   console.log('');
-
-  // Pricing reference
-  console.log('  Model pricing reference (per 1M tokens):');
-  console.log('    Opus:   $15.00 input / $75.00 output');
-  console.log('    Sonnet:  $3.00 input / $15.00 output');
-  console.log('    Haiku:   $0.25 input /  $1.25 output');
+  console.log(`  ${colorize('Total:', 'bold')} ${formatCost(totalCost)} across ${sorted.reduce((a, m) => a + m.calls, 0)} calls (${days}d)`);
   console.log('');
-
-  // JSON output
-  if (showJson) {
-    const jsonPath = path.join(cwd, 'models-report.json');
-    const report = {
-      timestamp: new Date().toISOString(),
-      days,
-      sessions: sessions.length,
-      totalTurns,
-      totalCost,
-      usage: Object.values(usage).map(u => ({
-        model: u.model,
-        tier: u.tier,
-        turns: u.turns,
-        cost: u.cost,
-        tasks: u.tasks,
-      })),
-      recommendations: recommendations.map(r => ({
-        from: r.from,
-        to: r.to,
-        taskType: r.taskType,
-        turns: r.turns,
-        currentCost: r.currentCost,
-        projectedCost: r.projectedCost,
-        savings: r.savings,
-      })),
-    };
-    fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-    console.log(`  ✓ JSON report saved to ${jsonPath}`);
-    console.log('');
-  }
 }

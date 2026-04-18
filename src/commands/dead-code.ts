@@ -1,286 +1,186 @@
 /**
- * Dead Code command — Find dead API routes, unused components, zombie dependencies
+ * dead-code command — Dead feature detector.
+ * Finds unused API routes, components, and zombie dependencies.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { execSync } from 'node:child_process';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { join, relative, basename } from 'node:path';
+import type { GlobalFlags } from '../cli';
+import { colorize, box, table, sectionHeader } from '../utils/format';
 
-interface DeadRoute {
-  route: string;
-  file: string;
-  lastModified: string;
-  daysAgo: number;
-}
-
-interface UnusedComponent {
-  name: string;
-  file: string;
-  importCount: number;
-}
-
-interface ZombieDep {
-  name: string;
-  version: string;
-  importCount: number;
-}
-
-function walkFiles(dir: string, filter: (name: string) => boolean): string[] {
-  const results: string[] = [];
-  if (!fs.existsSync(dir)) return results;
-
-  function recurse(d: string) {
-    let entries: fs.Dirent[];
+function findApiRoutes(cwd: string): string[] {
+  const routes: string[] = [];
+  function walk(dir: string) {
     try {
-      entries = fs.readdirSync(d, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = path.join(d, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === 'node_modules' || entry.name === '.next' || entry.name === '.git') continue;
-        recurse(full);
-      } else if (filter(entry.name)) {
-        results.push(full);
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          if (['node_modules', '.next'].includes(entry.name)) continue;
+          walk(join(dir, entry.name));
+        } else if (entry.name === 'route.ts' || entry.name === 'route.tsx') {
+          routes.push(relative(cwd, join(dir, entry.name)));
+        }
+      }
+    } catch { /* */ }
+  }
+  const apiDir = join(cwd, 'app', 'api');
+  if (existsSync(apiDir)) walk(apiDir);
+  return routes;
+}
+
+function findComponents(cwd: string): Array<{ file: string; name: string; lines: number }> {
+  const components: Array<{ file: string; name: string; lines: number }> = [];
+  function walk(dir: string) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          if (['node_modules', '.next', 'ui'].includes(entry.name)) continue;
+          walk(join(dir, entry.name));
+        } else if (entry.name.endsWith('.tsx') && /^[A-Z]/.test(entry.name)) {
+          const content = readFileSync(join(dir, entry.name), 'utf-8');
+          const lineCount = content.split('\n').length;
+          components.push({
+            file: relative(cwd, join(dir, entry.name)),
+            name: entry.name.replace('.tsx', ''),
+            lines: lineCount,
+          });
+        }
+      }
+    } catch { /* */ }
+  }
+  const compDir = join(cwd, 'components');
+  if (existsSync(compDir)) walk(compDir);
+  return components;
+}
+
+function isComponentImported(name: string, cwd: string): boolean {
+  try {
+    const result = execSync(
+      `grep -r "${name}" --include="*.ts" --include="*.tsx" -l "${join(cwd, 'app')}" "${join(cwd, 'components')}" 2>/dev/null | head -3`,
+      { encoding: 'utf-8', timeout: 5000 },
+    );
+    // More than 1 file means it's imported somewhere beyond its own definition
+    return result.trim().split('\n').filter(Boolean).length > 1;
+  } catch {
+    return true; // Assume imported if grep fails
+  }
+}
+
+function findZombieDeps(cwd: string): Array<{ name: string; type: string }> {
+  const zombies: Array<{ name: string; type: string }> = [];
+  try {
+    const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf-8'));
+    const deps = { ...pkg.dependencies };
+    // Skip obvious framework deps
+    const skipPrefixes = ['next', 'react', '@types', 'typescript', 'eslint', 'tailwind', 'postcss', 'autoprefixer', 'prisma', '@prisma'];
+
+    for (const dep of Object.keys(deps)) {
+      if (skipPrefixes.some(p => dep.startsWith(p))) continue;
+      try {
+        const result = execSync(
+          `grep -r "${dep}" --include="*.ts" --include="*.tsx" --include="*.js" -l "${join(cwd, 'app')}" "${join(cwd, 'lib')}" "${join(cwd, 'components')}" 2>/dev/null | head -1`,
+          { encoding: 'utf-8', timeout: 5000 },
+        );
+        if (!result.trim()) {
+          zombies.push({ name: dep, type: 'dependency' });
+        }
+      } catch {
+        // grep returns non-zero if no matches
+        zombies.push({ name: dep, type: 'dependency' });
       }
     }
-  }
-  recurse(dir);
-  return results;
+  } catch { /* */ }
+  return zombies.slice(0, 20); // Cap to avoid long output
 }
 
-function getGitLastModified(file: string): { date: string; daysAgo: number } | null {
-  try {
-    const output = execSync(
-      `git log -1 --format="%ai" -- "${file}" 2>/dev/null`,
-      { encoding: 'utf-8', cwd: process.cwd() }
-    ).trim();
-    if (!output) return null;
-    const date = new Date(output);
-    const now = new Date();
-    const daysAgo = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24));
-    return { date: output.split(' ')[0], daysAgo };
-  } catch {
-    return null;
-  }
-}
-
-function grepCount(pattern: string, dir: string, extensions: string[]): number {
-  try {
-    const globs = extensions.map(e => `--include="*${e}"`).join(' ');
-    const output = execSync(
-      `grep -r ${globs} -l "${pattern}" "${dir}" 2>/dev/null`,
-      { encoding: 'utf-8', cwd: process.cwd() }
-    ).trim();
-    return output ? output.split('\n').filter(Boolean).length : 0;
-  } catch {
-    return 0;
-  }
-}
-
-function findStaleRoutes(cwd: string, staleDays: number): DeadRoute[] {
-  const apiDir = path.join(cwd, 'app', 'api');
-  const routeFiles = walkFiles(apiDir, name => name === 'route.ts' || name === 'route.tsx');
-  const results: DeadRoute[] = [];
-
-  for (const file of routeFiles) {
-    const gitInfo = getGitLastModified(file);
-    if (!gitInfo) continue;
-    if (gitInfo.daysAgo > staleDays) {
-      const relPath = path.relative(cwd, file).replace(/\\/g, '/');
-      const route = '/' + path.relative(path.join(cwd, 'app'), path.dirname(file)).replace(/\\/g, '/');
-      results.push({
-        route,
-        file: relPath,
-        lastModified: gitInfo.date,
-        daysAgo: gitInfo.daysAgo,
-      });
-    }
-  }
-
-  return results.sort((a, b) => b.daysAgo - a.daysAgo);
-}
-
-function findUnusedComponents(cwd: string): UnusedComponent[] {
-  const componentsDir = path.join(cwd, 'components');
-  const componentFiles = walkFiles(componentsDir, name =>
-    name.endsWith('.tsx') && /^[A-Z]/.test(name)
-  );
-
-  const results: UnusedComponent[] = [];
-  const searchDirs = [
-    path.join(cwd, 'app'),
-    path.join(cwd, 'components'),
-    path.join(cwd, 'lib'),
-  ];
-
-  for (const file of componentFiles) {
-    const name = path.basename(file, '.tsx');
-    let totalImports = 0;
-
-    for (const dir of searchDirs) {
-      if (!fs.existsSync(dir)) continue;
-      // Count imports of this component, exclude the file itself
-      const count = grepCount(name, dir, ['.ts', '.tsx']);
-      totalImports += count;
-    }
-
-    // Subtract 1 for the file itself (its own export)
-    const externalImports = Math.max(0, totalImports - 1);
-
-    if (externalImports === 0) {
-      results.push({
-        name,
-        file: path.relative(cwd, file).replace(/\\/g, '/'),
-        importCount: externalImports,
-      });
-    }
-  }
-
-  return results;
-}
-
-function findZombieDeps(cwd: string): ZombieDep[] {
-  const pkgPath = path.join(cwd, 'package.json');
-  if (!fs.existsSync(pkgPath)) return [];
-
-  let pkg: { dependencies?: Record<string, string> };
-  try {
-    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-  } catch {
-    return [];
-  }
-
-  const deps = pkg.dependencies || {};
-  const results: ZombieDep[] = [];
-
-  // Framework deps that are used implicitly
-  const frameworkDeps = new Set([
-    'react', 'react-dom', 'next', 'typescript', '@types/node', '@types/react',
-    '@types/react-dom', 'eslint', 'eslint-config-next', 'postcss', 'tailwindcss',
-    'autoprefixer', 'prisma', '@prisma/client', 'sharp',
-  ]);
-
-  const searchDirs = [
-    path.join(cwd, 'app'),
-    path.join(cwd, 'components'),
-    path.join(cwd, 'lib'),
-    path.join(cwd, 'hooks'),
-    path.join(cwd, 'contexts'),
-  ];
-
-  for (const [name, version] of Object.entries(deps)) {
-    if (frameworkDeps.has(name)) continue;
-
-    let totalImports = 0;
-    for (const dir of searchDirs) {
-      if (!fs.existsSync(dir)) continue;
-      totalImports += grepCount(name, dir, ['.ts', '.tsx', '.js', '.jsx']);
-    }
-
-    if (totalImports === 0) {
-      results.push({ name, version, importCount: 0 });
-    }
-  }
-
-  return results;
-}
-
-export async function deadCode(args: string[]): Promise<void> {
-  const showRoutes = args.includes('--routes');
-  const showComponents = args.includes('--components');
-  const showDeps = args.includes('--deps');
-  const showJson = args.includes('--json');
-  const showAll = !showRoutes && !showComponents && !showDeps;
+export async function deadCodeCommand(flags: GlobalFlags): Promise<void> {
   const cwd = process.cwd();
+  const { json } = flags;
+  const checkRoutes = !flags.args.includes('--components') && !flags.args.includes('--deps');
+  const checkComponents = !flags.args.includes('--routes') && !flags.args.includes('--deps');
+  const checkDeps = !flags.args.includes('--routes') && !flags.args.includes('--components');
 
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  DEAD CODE DETECTOR                                         ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
+  const results: {
+    deadRoutes: string[];
+    deadComponents: Array<{ file: string; name: string; lines: number }>;
+    zombieDeps: Array<{ name: string; type: string }>;
+  } = { deadRoutes: [], deadComponents: [], zombieDeps: [] };
 
-  const jsonOutput: Record<string, unknown> = {};
-
-  // 1. Stale API Routes
-  if (showAll || showRoutes) {
-    console.log('  Scanning API routes...');
-    const staleRoutes = findStaleRoutes(cwd, 180);
-
-    if (staleRoutes.length > 0) {
-      console.log('');
-      console.log('  ┌─────────────────────────────────────────────────────────┐');
-      console.log(`  │  STALE ROUTES (${staleRoutes.length} unchanged >180 days)`.padEnd(60) + '│');
-      console.log('  ├─────────────────────────────────────────────────────────┤');
-      for (const route of staleRoutes.slice(0, 20)) {
-        console.log(`  │  ○ ${route.route}`.padEnd(60) + '│');
-        console.log(`  │    ${route.daysAgo}d ago  ${route.file}`.padEnd(60) + '│');
-      }
-      if (staleRoutes.length > 20) {
-        console.log(`  │  ... and ${staleRoutes.length - 20} more`.padEnd(60) + '│');
-      }
-      console.log('  └─────────────────────────────────────────────────────────┘');
-    } else {
-      console.log('  ✓ No stale API routes found (all modified within 180 days)');
+  // Check API routes (can't verify traffic without Vercel API, so just count them)
+  if (checkRoutes) {
+    const routes = findApiRoutes(cwd);
+    // Report total route count — without analytics, we can't know which are dead
+    // But we can report routes that have very old last-modified dates
+    for (const route of routes) {
+      try {
+        const log = execSync(`git log -1 --format="%aI" -- "${route}"`, { encoding: 'utf-8', timeout: 3000 }).trim();
+        if (log) {
+          const daysSinceModified = (Date.now() - new Date(log).getTime()) / 86400000;
+          if (daysSinceModified > 180) { // Not touched in 6 months
+            results.deadRoutes.push(route);
+          }
+        }
+      } catch { /* */ }
     }
-    console.log('');
-    jsonOutput.staleRoutes = staleRoutes;
   }
 
-  // 2. Unused Components
-  if (showAll || showComponents) {
-    console.log('  Scanning components...');
-    const unused = findUnusedComponents(cwd);
-
-    if (unused.length > 0) {
-      console.log('');
-      console.log('  ┌─────────────────────────────────────────────────────────┐');
-      console.log(`  │  UNUSED COMPONENTS (${unused.length} with 0 imports)`.padEnd(60) + '│');
-      console.log('  ├─────────────────────────────────────────────────────────┤');
-      for (const comp of unused.slice(0, 20)) {
-        console.log(`  │  ✗ ${comp.name}`.padEnd(60) + '│');
-        console.log(`  │    ${comp.file}`.padEnd(60) + '│');
+  // Check components
+  if (checkComponents) {
+    const components = findComponents(cwd);
+    for (const comp of components.slice(0, 50)) { // Cap to avoid long scan
+      if (!isComponentImported(comp.name, cwd)) {
+        results.deadComponents.push(comp);
       }
-      if (unused.length > 20) {
-        console.log(`  │  ... and ${unused.length - 20} more`.padEnd(60) + '│');
-      }
-      console.log('  └─────────────────────────────────────────────────────────┘');
-    } else {
-      console.log('  ✓ No unused components detected');
     }
-    console.log('');
-    jsonOutput.unusedComponents = unused;
   }
 
-  // 3. Zombie Dependencies
-  if (showAll || showDeps) {
-    console.log('  Scanning dependencies...');
-    const zombies = findZombieDeps(cwd);
+  // Check dependencies
+  if (checkDeps) {
+    results.zombieDeps = findZombieDeps(cwd);
+  }
 
-    if (zombies.length > 0) {
-      console.log('');
-      console.log('  ┌─────────────────────────────────────────────────────────┐');
-      console.log(`  │  ZOMBIE DEPENDENCIES (${zombies.length} possibly unused)`.padEnd(60) + '│');
-      console.log('  ├─────────────────────────────────────────────────────────┤');
-      for (const dep of zombies.slice(0, 20)) {
-        console.log(`  │  ✗ ${dep.name}@${dep.version}`.padEnd(60) + '│');
-      }
-      if (zombies.length > 20) {
-        console.log(`  │  ... and ${zombies.length - 20} more`.padEnd(60) + '│');
-      }
-      console.log('  └─────────────────────────────────────────────────────────┘');
-    } else {
-      console.log('  ✓ No zombie dependencies detected');
+  if (json) {
+    console.log(JSON.stringify(results, null, 2));
+    return;
+  }
+
+  const lines: string[] = [];
+
+  if (results.deadRoutes.length > 0) {
+    lines.push(colorize(`STALE API ROUTES (not modified in 180+ days):`, 'bold'));
+    for (const route of results.deadRoutes.slice(0, 10)) {
+      lines.push(`  ${colorize('-', 'dim')} ${route}`);
     }
-    console.log('');
-    jsonOutput.zombieDeps = zombies;
+    if (results.deadRoutes.length > 10) lines.push(colorize(`  ... and ${results.deadRoutes.length - 10} more`, 'dim'));
+    lines.push('');
   }
 
-  if (showJson) {
-    const outPath = path.join(cwd, 'dead-code.json');
-    fs.writeFileSync(outPath, JSON.stringify(jsonOutput, null, 2));
-    console.log(`  ✓ JSON exported to ${outPath}`);
-    console.log('');
+  if (results.deadComponents.length > 0) {
+    lines.push(colorize(`POTENTIALLY UNUSED COMPONENTS:`, 'bold'));
+    let totalLines = 0;
+    for (const comp of results.deadComponents.slice(0, 10)) {
+      lines.push(`  ${colorize('-', 'dim')} ${comp.file} (${comp.lines} lines)`);
+      totalLines += comp.lines;
+    }
+    lines.push(colorize(`  ${results.deadComponents.length} components, ~${totalLines} lines removable`, 'yellow'));
+    lines.push('');
   }
+
+  if (results.zombieDeps.length > 0) {
+    lines.push(colorize(`ZOMBIE DEPENDENCIES (installed but possibly unused):`, 'bold'));
+    for (const dep of results.zombieDeps.slice(0, 10)) {
+      lines.push(`  ${colorize('-', 'dim')} ${dep.name}`);
+    }
+    if (results.zombieDeps.length > 10) lines.push(colorize(`  ... and ${results.zombieDeps.length - 10} more`, 'dim'));
+    lines.push('');
+  }
+
+  const totalIssues = results.deadRoutes.length + results.deadComponents.length + results.zombieDeps.length;
+  if (totalIssues === 0) {
+    lines.push(colorize('No obvious dead code found.', 'green'));
+  } else {
+    lines.push(`${colorize(String(totalIssues), 'bold')} potential issues found`);
+  }
+
+  box('Dead Code Analysis', lines.join('\n'));
 }

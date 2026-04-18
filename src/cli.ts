@@ -1,165 +1,216 @@
 #!/usr/bin/env node
-
 /**
- * promptreports-cli — Vibe Coding Infrastructure Optimizer
+ * promptreports-cli — Vibe coding intelligence.
  *
- * Zero config. Zero dependencies. Works first run.
- *
- * Usage:
- *   npx promptreports-cli              # Summary, last 7 days
- *   npx promptreports-cli scan         # Full scan: tokens + providers
- *   npx promptreports-cli push         # Push to promptreports.ai
- *   npx promptreports-cli optimize     # AI optimization recommendations
- *   npx promptreports-cli init         # Interactive setup wizard
- *   npx promptreports-cli install-skills  # Install .claude/skills/
+ * Unified ops, cost tracking, environment sync, and developer tools.
+ * Zero external dependencies.
  */
 
-import { summary } from './commands/summary.js';
-import { scan } from './commands/scan.js';
-import { push } from './commands/push.js';
-import { optimize } from './commands/optimize.js';
-import { init } from './commands/init.js';
-import { installSkills } from './commands/install-skills.js';
-import { login } from './commands/login.js';
-import { doctor } from './commands/doctor.js';
-import { promptsAudit } from './commands/prompts-audit.js';
-import { deadCode } from './commands/dead-code.js';
-import { sessions } from './commands/sessions.js';
-import { deps } from './commands/deps.js';
-import { gitIntel } from './commands/git-intel.js';
-import { schema } from './commands/schema.js';
-import { logs } from './commands/logs.js';
-import { envSync } from './commands/env-sync.js';
-import { health } from './commands/health.js';
-import { context } from './commands/context.js';
-import { costs } from './commands/costs.js';
-import { models } from './commands/models.js';
-import { setup } from './commands/setup.js';
-import { audit } from './commands/audit.js';
+import { summaryCommand } from './commands/summary';
+import { pushCommand } from './commands/push';
+import { providersCommand } from './commands/providers';
+import { doctorCommand } from './commands/doctor';
+import { envSyncCommand } from './commands/env-sync';
+import { logsCommand } from './commands/logs';
+import { setupCommand } from './commands/setup';
+import { healthCommand } from './commands/health';
+import { contextCommand } from './commands/context';
+import { costsCommand } from './commands/costs';
+import { promptsCommand } from './commands/prompts';
+import { deadCodeCommand } from './commands/dead-code';
+import { sessionsCommand } from './commands/sessions';
+import { depsCommand } from './commands/deps';
+import { schemaCommand } from './commands/schema';
+import { modelsCommand } from './commands/models';
+import { gitIntelCommand } from './commands/git-intel';
+import { auditCommand } from './commands/audit';
+import { filterCommand } from './commands/filter';
+import { colorize } from './utils/format';
 
-const VERSION = '1.1.0'; // Vibe Coder Toolkit — 22 commands
+// ─── Global Flags ───────────────────────────────────────────────────────────
 
-async function main() {
-  const command = process.argv[2];
+export interface GlobalFlags {
+  days: number;
+  json: boolean;
+  quiet: boolean;
+  dryRun: boolean;
+  /** Raw args after the command name */
+  args: string[];
+}
 
-  if (command === '--version' || command === '-v') {
-    console.log(`promptreports-cli v${VERSION}`);
-    process.exit(0);
+function parseGlobalFlags(argv: string[]): { command: string; subcommand: string; flags: GlobalFlags } {
+  const args = argv.slice(2); // skip node + script
+
+  let days = 7;
+  let json = false;
+  let quiet = false;
+  let dryRun = false;
+
+  const remaining: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--days' && i + 1 < args.length) {
+      days = parseInt(args[i + 1], 10) || 7;
+      i++;
+    } else if (arg === '--today') {
+      days = 1;
+    } else if (arg === '--json') {
+      json = true;
+    } else if (arg === '--quiet') {
+      quiet = true;
+    } else if (arg === '--dry-run') {
+      dryRun = true;
+    } else {
+      remaining.push(arg);
+    }
   }
 
-  if (command === '--help' || command === '-h' || command === 'help') {
-    printHelp();
-    process.exit(0);
-  }
+  const command = remaining[0] || 'summary';
+  const subcommand = remaining[1] || '';
+  const restArgs = remaining.slice(1);
 
-  switch (command) {
-    case 'scan':       return scan(process.argv.slice(3));
-    case 'push':       return push(process.argv.slice(3));
-    case 'optimize':   return optimize(process.argv.slice(3));
-    case 'init':       return init(process.argv.slice(3));
-    case 'install-skills': return installSkills(process.argv.slice(3));
-    case 'login':      return login(process.argv.slice(3));
-    case 'doctor':     return doctor(process.argv.slice(3));
-    case 'prompts-audit': return promptsAudit(process.argv.slice(3));
-    case 'dead-code':  return deadCode(process.argv.slice(3));
-    case 'sessions':   return sessions(process.argv.slice(3));
-    case 'deps':       return deps(process.argv.slice(3));
-    case 'git-intel':  return gitIntel(process.argv.slice(3));
-    case 'schema':     return schema(process.argv.slice(3));
-    case 'logs':       return logs(process.argv.slice(3));
-    case 'env-sync':   return envSync(process.argv.slice(3));
-    case 'health':     return health(process.argv.slice(3));
-    case 'context':    return context(process.argv.slice(3));
-    case 'costs':      return costs(process.argv.slice(3));
-    case 'models':     return models(process.argv.slice(3));
-    case 'setup':      return setup(process.argv.slice(3));
-    case 'providers':  return scan(process.argv.slice(3)); // alias for scan
-    case 'audit':      return audit(process.argv.slice(3));
-    default:
-      return summary(process.argv.slice(2));
+  return {
+    command,
+    subcommand,
+    flags: { days, json, quiet, dryRun, args: restArgs },
+  };
+}
+
+// ─── Help Text ──────────────────────────────────────────────────────────────
+
+function printHelp(): void {
+  console.log('');
+  console.log(colorize('  promptreports-cli', 'bold') + colorize(' v1.2.1', 'dim'));
+  console.log(colorize('  Vibe coding intelligence for developers', 'dim'));
+  console.log('');
+  console.log(colorize('  CORE', 'bold'));
+  console.log('    summary              Token usage summary (default)');
+  console.log('    push                 Push stats to PromptReports.ai');
+  console.log('    providers            Provider cost scan');
+  console.log('    doctor               System health check');
+  console.log('    audit                Claude Code expert audit (.claude, skills, env)');
+  console.log('    audit claude-md      Deep CLAUDE.md slim-down analysis (NEW)');
+  console.log('    filter -- <cmd>      Compress subprocess output before your agent reads it (NEW)');
+  console.log('');
+  console.log(colorize('  ENVIRONMENT & SETUP', 'bold'));
+  console.log('    env sync             Sync .env.local with Vercel/Railway');
+  console.log('    setup export         Export machine config (encrypted)');
+  console.log('    setup import         Import config on a new machine');
+  console.log('    health               Post-deploy health check');
+  console.log('');
+  console.log(colorize('  INTELLIGENCE', 'bold'));
+  console.log('    context              Context window optimizer');
+  console.log('    context --ghosts     Find silent waste in session files (NEW)');
+  console.log('    costs                Cost attribution by feature/model/commit');
+  console.log('    models               Model router — suggest cheaper models');
+  console.log('    prompts audit        Prompt drift detector');
+  console.log('');
+  console.log(colorize('  CODEBASE ANALYSIS', 'bold'));
+  console.log('    dead-code            Find unused routes, components, deps');
+  console.log('    deps                 Dependency audit, outdated, licenses');
+  console.log('    schema               Prisma schema stats & drift detection');
+  console.log('    git-intel            Git patterns, hotspots, velocity');
+  console.log('');
+  console.log(colorize('  SESSION TOOLS', 'bold'));
+  console.log('    sessions             Session history, replay, search');
+  console.log('    logs                 Unified log stream (Sentry/Vercel/PostHog)');
+  console.log('');
+  console.log(colorize('  GLOBAL FLAGS', 'bold'));
+  console.log('    --days N             Lookback period in days (default: 7)');
+  console.log('    --today              Shorthand for --days 1');
+  console.log('    --json               Output JSON instead of formatted text');
+  console.log('    --quiet              Suppress non-essential output');
+  console.log('    --dry-run            Preview changes without writing');
+  console.log('');
+  console.log(colorize('  EXAMPLES', 'bold'));
+  console.log('    promptreports                            # Token summary');
+  console.log('    promptreports providers --days 30        # 30-day provider costs');
+  console.log('    promptreports env sync --diff            # Show env drift');
+  console.log('    promptreports health                     # Post-deploy check');
+  console.log('    promptreports costs --by model           # Cost by AI model');
+  console.log('    promptreports costs --by commit          # Cost per git commit');
+  console.log('    promptreports context                    # Context window analysis');
+  console.log('    promptreports models                     # Model optimization tips');
+  console.log('    promptreports prompts audit              # Prompt drift scan');
+  console.log('    promptreports dead-code                  # Find dead code');
+  console.log('    promptreports sessions --list            # Session history');
+  console.log('    promptreports sessions --replay abc123   # Replay a session');
+  console.log('    promptreports sessions --search "prisma" # Search sessions');
+  console.log('    promptreports logs --source sentry       # Sentry errors only');
+  console.log('    promptreports logs --since 1h --level error');
+  console.log('    promptreports deps --audit               # Security audit');
+  console.log('    promptreports deps --outdated            # Check for updates');
+  console.log('    promptreports schema --drift             # Schema vs DB');
+  console.log('    promptreports git-intel                  # Full git analysis');
+  console.log('    promptreports git-intel --changelog      # Auto changelog');
+  console.log('    promptreports setup export --all --encrypt mypass');
+  console.log('    promptreports setup import bundle.json --decrypt mypass');
+  console.log('    promptreports doctor                     # System check');
+  console.log('    promptreports audit                      # Claude Code expert audit');
+  console.log('    promptreports audit claude-md            # Deep CLAUDE.md slim-down analysis');
+  console.log('    promptreports audit --push               # Audit + push to Command Center');
+  console.log('    promptreports audit --json               # JSON audit results');
+  console.log('    promptreports context --ghosts           # Find silent token waste');
+  console.log('    promptreports filter -- npm test         # Compress noisy test output');
+  console.log('    promptreports filter -- playwright test  # Dedupe stack frames, truncate blocks');
+  console.log('    promptreports push --dry-run             # Preview push');
+  console.log('');
+}
+
+// ─── Command Router ─────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const { command, subcommand, flags } = parseGlobalFlags(process.argv);
+
+  try {
+    switch (command) {
+      case 'summary':     await summaryCommand(flags); break;
+      case 'push':        await pushCommand(flags); break;
+      case 'providers':   await providersCommand(flags); break;
+      case 'doctor':      await doctorCommand(flags); break;
+      case 'audit':       await auditCommand(flags); break;
+      case 'filter':      await filterCommand(flags); break;
+      case 'env':         await envSyncCommand(flags); break;
+      case 'logs':        await logsCommand(flags); break;
+      case 'health':      await healthCommand(flags); break;
+      case 'context':     await contextCommand(flags); break;
+      case 'costs':       await costsCommand(flags); break;
+      case 'models':      await modelsCommand(flags); break;
+      case 'dead-code':   await deadCodeCommand(flags); break;
+      case 'deps':        await depsCommand(flags); break;
+      case 'schema':      await schemaCommand(flags); break;
+      case 'git-intel':   await gitIntelCommand(flags); break;
+      case 'sessions':    await sessionsCommand(flags); break;
+
+      case 'prompts':
+        await promptsCommand(flags);
+        break;
+
+      case 'setup':
+        if (subcommand === 'export' || subcommand === 'import') {
+          await setupCommand(subcommand, flags);
+        } else {
+          console.error(`Unknown setup subcommand: ${subcommand}. Use: setup export|import`);
+          process.exit(1);
+        }
+        break;
+
+      case 'help':
+      case '--help':
+      case '-h':
+        printHelp();
+        break;
+
+      default:
+        console.error(`Unknown command: ${command}`);
+        printHelp();
+        process.exit(1);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(colorize(`\n  Error: ${message}\n`, 'red'));
+    process.exit(1);
   }
 }
 
-function printHelp() {
-  console.log(`
-  promptreports-cli v${VERSION} — Vibe Coding Infrastructure Optimizer
-
-  USAGE
-    npx promptreports-cli [command] [options]
-
-  CORE
-    (default)          Token usage summary (last 7 days)
-    scan / providers   Full provider cost scan (22+ services)
-    push               Push stats to promptreports.ai
-    doctor             Diagnose setup issues
-    audit              Claude Code expert audit (score 0-100)
-
-  ENVIRONMENT & SETUP
-    env-sync           Compare .env.local vs Vercel env vars
-    health             Post-deploy health check (score 0-100)
-    setup export       Export machine config (encrypted)
-    setup import       Import config on a new machine
-    logs               Unified log stream (Sentry, Vercel, PostHog)
-
-  INTELLIGENCE
-    context            Context window optimizer
-    costs              Cost attribution (--by model/commit/feature)
-    models             Model router tuner with downgrade suggestions
-    prompts-audit      Detect prompt drift and deprecated models
-
-  CODEBASE ANALYSIS
-    dead-code          Find dead routes, unused components, zombie deps
-    deps               Dependency audit, outdated, unused, licenses
-    schema             Prisma schema stats and drift detection
-    git-intel          Git hotspots, velocity, debt, patterns
-
-  SESSION TOOLS
-    sessions           Session replay, search, and history
-
-  OTHER
-    optimize           AI optimization recommendations
-    init               Interactive setup wizard
-    install-skills     Install .claude/skills/ templates
-    login              Set PromptReports.ai API key
-    help               Show this help
-
-  GLOBAL FLAGS
-    --days N           Lookback period (default: 7)
-    --today            Today only (shorthand for --days 1)
-    --json             Output JSON for processing
-    --dry-run          Preview changes without writing
-
-  EXAMPLES
-    npx promptreports-cli                                 # Token summary
-    npx promptreports-cli providers --days 30             # 30-day provider costs
-    npx promptreports-cli env-sync --diff                 # Show env drift
-    npx promptreports-cli health                          # Post-deploy check
-    npx promptreports-cli costs --by model                # Cost by AI model
-    npx promptreports-cli costs --by commit               # Cost per git commit
-    npx promptreports-cli context                         # Context window analysis
-    npx promptreports-cli models                          # Model optimization tips
-    npx promptreports-cli prompts-audit                   # Prompt drift scan
-    npx promptreports-cli dead-code                       # Find dead code
-    npx promptreports-cli sessions --list                 # Session history
-    npx promptreports-cli sessions --replay abc123        # Replay a session
-    npx promptreports-cli sessions --search "prisma"      # Search sessions
-    npx promptreports-cli logs --source sentry            # Sentry errors only
-    npx promptreports-cli logs --since 1h --level error   # Errors in last hour
-    npx promptreports-cli deps --audit                    # Security audit
-    npx promptreports-cli deps --outdated                 # Check for updates
-    npx promptreports-cli schema --drift                  # Schema vs DB
-    npx promptreports-cli git-intel                       # Full git analysis
-    npx promptreports-cli git-intel --changelog           # Auto changelog
-    npx promptreports-cli setup export --all --encrypt pw # Export encrypted config
-    npx promptreports-cli setup import bundle.json        # Import on new machine
-    npx promptreports-cli push --dry-run                  # Preview push
-
-  DASHBOARD
-    https://promptreports.ai/swarm/toolkit
-`);
-}
-
-main().catch((err) => {
-  console.error(`  Error: ${err.message}`);
-  process.exit(1);
-});
+main();

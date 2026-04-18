@@ -1,288 +1,159 @@
 /**
- * Health command — Post-deploy health check
+ * health command — Post-deploy health check across all services.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { execSync } from 'node:child_process';
+import type { GlobalFlags } from '../cli';
+import { discoverFromProject } from '../../fetchers/env-discovery';
+import { runAllFetchers } from '../../fetchers/index';
+import { colorize, statusIcon, box, formatCost } from '../utils/format';
 
 interface HealthCheck {
   name: string;
-  status: 'pass' | 'fail' | 'warn' | 'skip';
+  status: 'ok' | 'warning' | 'error';
   detail: string;
-  points: number;
-  maxPoints: number;
+  value?: string;
 }
 
-function parseEnvFile(filePath: string): Record<string, string> {
-  const vars: Record<string, string> = {};
-  if (!fs.existsSync(filePath)) return vars;
-
+async function getLastDeploy(token: string): Promise<{ hash: string; time: string; state: string } | null> {
   try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
-      if (key) vars[key] = val;
-    }
-  } catch {}
-
-  return vars;
-}
-
-async function checkProductionUrl(url: string): Promise<{ ok: boolean; statusCode: number; latencyMs: number }> {
-  const start = Date.now();
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
-    clearTimeout(timeout);
-    return { ok: res.ok, statusCode: res.status, latencyMs: Date.now() - start };
-  } catch {
-    return { ok: false, statusCode: 0, latencyMs: Date.now() - start };
-  }
-}
-
-async function checkSentry(token: string, org: string, project: string): Promise<{ ok: boolean; recentErrors: number }> {
-  try {
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const url = `https://sentry.io/api/0/projects/${org}/${project}/issues/?query=is:unresolved&statsPeriod=24h&limit=25`;
-    const res = await fetch(url, {
+    const res = await fetch('https://api.vercel.com/v6/deployments?limit=1&state=READY', {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) return { ok: false, recentErrors: -1 };
-    const issues = await res.json() as Array<{ count: string }>;
-    return { ok: true, recentErrors: issues.length };
+    if (!res.ok) return null;
+    const data = await res.json();
+    const d = data.deployments?.[0];
+    if (!d) return null;
+    return { hash: d.meta?.githubCommitSha?.slice(0, 8) || '', time: new Date(d.created).toISOString(), state: d.state };
   } catch {
-    return { ok: false, recentErrors: -1 };
+    return null;
   }
 }
 
-export async function health(args: string[]): Promise<void> {
-  const showJson = args.includes('--json');
-  const cwd = process.cwd();
-  const envPath = path.join(cwd, '.env.local');
-  const envVars = parseEnvFile(envPath);
-
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  HEALTH CHECK — Post-Deploy Verification                    ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
-
-  const checks: HealthCheck[] = [];
-
-  // 1. Production URL check
-  const prodUrl = envVars['NEXTAUTH_URL'] || envVars['NEXT_PUBLIC_APP_URL'] || '';
-  if (prodUrl) {
-    console.log(`  Pinging ${prodUrl}...`);
-    const result = await checkProductionUrl(prodUrl);
-    if (result.ok) {
-      checks.push({
-        name: 'Production URL',
-        status: 'pass',
-        detail: `${result.statusCode} OK — ${result.latencyMs}ms`,
-        points: 30,
-        maxPoints: 30,
-      });
-    } else {
-      checks.push({
-        name: 'Production URL',
-        status: 'fail',
-        detail: result.statusCode > 0
-          ? `HTTP ${result.statusCode} — ${result.latencyMs}ms`
-          : `Unreachable after ${result.latencyMs}ms`,
-        points: 0,
-        maxPoints: 30,
-      });
-    }
-  } else {
-    checks.push({
-      name: 'Production URL',
-      status: 'skip',
-      detail: 'No NEXTAUTH_URL or NEXT_PUBLIC_APP_URL found in .env.local',
-      points: 0,
-      maxPoints: 30,
-    });
+async function checkSentryErrors(token: string, sinceMs: number): Promise<HealthCheck> {
+  const org = process.env.SENTRY_ORG || '';
+  const project = process.env.SENTRY_PROJECT || '';
+  if (!org || !project) {
+    return { name: 'Sentry errors', status: 'warning', detail: 'SENTRY_ORG or SENTRY_PROJECT not set' };
   }
-
-  // 2. Sentry check
-  const sentryToken = envVars['SENTRY_AUTH_TOKEN'] || '';
-  const sentryOrg = envVars['SENTRY_ORG'] || '';
-  const sentryProject = envVars['SENTRY_PROJECT'] || '';
-  if (sentryToken && sentryOrg && sentryProject) {
-    console.log('  Checking Sentry for recent errors...');
-    const result = await checkSentry(sentryToken, sentryOrg, sentryProject);
-    if (result.ok) {
-      if (result.recentErrors === 0) {
-        checks.push({
-          name: 'Sentry Errors (24h)',
-          status: 'pass',
-          detail: 'No unresolved issues in last 24h',
-          points: 25,
-          maxPoints: 25,
-        });
-      } else {
-        checks.push({
-          name: 'Sentry Errors (24h)',
-          status: 'warn',
-          detail: `${result.recentErrors} unresolved issues in last 24h`,
-          points: 10,
-          maxPoints: 25,
-        });
-      }
-    } else {
-      checks.push({
-        name: 'Sentry Errors (24h)',
-        status: 'fail',
-        detail: 'Could not reach Sentry API — check token/org/project',
-        points: 0,
-        maxPoints: 25,
-      });
-    }
-  } else {
-    checks.push({
-      name: 'Sentry Errors (24h)',
-      status: 'skip',
-      detail: 'Missing SENTRY_AUTH_TOKEN, SENTRY_ORG, or SENTRY_PROJECT',
-      points: 0,
-      maxPoints: 25,
-    });
-  }
-
-  // 3. Git status check
   try {
-    const gitStatus = execSync('git status --porcelain 2>/dev/null', { encoding: 'utf-8', cwd }).trim();
-    const branch = execSync('git rev-parse --abbrev-ref HEAD 2>/dev/null', { encoding: 'utf-8', cwd }).trim();
-    const lastCommit = execSync('git log -1 --format="%h %s" 2>/dev/null', { encoding: 'utf-8', cwd }).trim();
+    const hours = Math.max(1, Math.round(sinceMs / 3600000));
+    const res = await fetch(
+      `https://sentry.io/api/0/projects/${org}/${project}/issues/?query=is:unresolved&statsPeriod=${hours}h&limit=5`,
+      { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10000) },
+    );
+    if (!res.ok) return { name: 'Sentry errors', status: 'warning', detail: `API returned ${res.status}` };
+    const issues = await res.json();
+    const count = (issues as any[]).length;
+    if (count === 0) return { name: 'Sentry errors', status: 'ok', detail: '0 new errors since deploy' };
+    return { name: 'Sentry errors', status: count > 3 ? 'error' : 'warning', detail: `${count} unresolved issues`, value: String(count) };
+  } catch (e) {
+    return { name: 'Sentry errors', status: 'warning', detail: 'Failed to fetch' };
+  }
+}
 
-    if (gitStatus.length === 0) {
-      checks.push({
-        name: 'Git Status',
-        status: 'pass',
-        detail: `Clean on ${branch} — last: ${lastCommit}`,
-        points: 20,
-        maxPoints: 20,
-      });
-    } else {
-      const dirtyFiles = gitStatus.split('\n').length;
-      checks.push({
-        name: 'Git Status',
-        status: 'warn',
-        detail: `${dirtyFiles} uncommitted changes on ${branch}`,
-        points: 10,
-        maxPoints: 20,
-      });
-    }
+async function checkProductionUrl(): Promise<HealthCheck> {
+  const url = process.env.NEXTAUTH_URL || process.env.NEXT_PUBLIC_APP_URL || '';
+  if (!url) return { name: 'Production URL', status: 'warning', detail: 'NEXTAUTH_URL not set' };
+  try {
+    const start = Date.now();
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const ms = Date.now() - start;
+    if (res.ok) return { name: 'Production URL', status: 'ok', detail: `Responding (${ms}ms)`, value: `${ms}ms` };
+    return { name: 'Production URL', status: 'error', detail: `HTTP ${res.status} (${ms}ms)` };
   } catch {
-    checks.push({
-      name: 'Git Status',
-      status: 'skip',
-      detail: 'No git repository detected',
-      points: 0,
-      maxPoints: 20,
-    });
+    return { name: 'Production URL', status: 'error', detail: 'Not responding' };
+  }
+}
+
+async function checkProviderBilling(days: number): Promise<HealthCheck> {
+  const { envVars } = discoverFromProject(process.cwd());
+  try {
+    const results = await runAllFetchers(envVars, days, 'p0');
+    const okProviders = results.filter(r => r.status === 'ok');
+    const totalCost = okProviders.reduce((sum, r) => sum + r.cost.amount, 0);
+    const errors = results.filter(r => r.status === 'error');
+    if (errors.length > 0) {
+      return { name: 'Provider billing', status: 'warning', detail: `${errors.length} providers returned errors`, value: formatCost(totalCost) };
+    }
+    return { name: 'Provider billing', status: 'ok', detail: `${okProviders.length} providers — ${formatCost(totalCost)} total`, value: formatCost(totalCost) };
+  } catch {
+    return { name: 'Provider billing', status: 'warning', detail: 'Failed to scan providers' };
+  }
+}
+
+function checkGitStatus(): HealthCheck {
+  try {
+    const status = execSync('git status --porcelain', { encoding: 'utf-8' }).trim();
+    const uncommitted = status.split('\n').filter(l => l.trim()).length;
+    if (uncommitted === 0) return { name: 'Git status', status: 'ok', detail: 'Clean working tree' };
+    return { name: 'Git status', status: 'warning', detail: `${uncommitted} uncommitted changes` };
+  } catch {
+    return { name: 'Git status', status: 'warning', detail: 'Not a git repository' };
+  }
+}
+
+function checkDatabaseUrl(): HealthCheck {
+  const dbUrl = process.env.DATABASE_URL || '';
+  if (!dbUrl) return { name: 'Database URL', status: 'warning', detail: 'DATABASE_URL not set' };
+  return { name: 'Database URL', status: 'ok', detail: 'Set' };
+}
+
+export async function healthCommand(flags: GlobalFlags): Promise<void> {
+  const vercelToken = process.env.VERCEL_TOKEN || '';
+  const sentryToken = process.env.SENTRY_AUTH_TOKEN || '';
+
+  // Get last deploy time to determine "since" window
+  let sinceMs = flags.days * 86400000;
+  let lastDeploy: { hash: string; time: string; state: string } | null = null;
+
+  if (vercelToken) {
+    lastDeploy = await getLastDeploy(vercelToken);
+    if (lastDeploy) {
+      sinceMs = Date.now() - new Date(lastDeploy.time).getTime();
+    }
   }
 
-  // 4. DATABASE_URL check
-  const dbUrl = envVars['DATABASE_URL'] || process.env.DATABASE_URL || '';
-  if (dbUrl) {
-    // Mask the URL for display
-    const masked = dbUrl.replace(/\/\/[^@]+@/, '//***@');
-    checks.push({
-      name: 'DATABASE_URL',
-      status: 'pass',
-      detail: `Set — ${masked.slice(0, 50)}${masked.length > 50 ? '…' : ''}`,
-      points: 15,
-      maxPoints: 15,
-    });
-  } else {
-    checks.push({
-      name: 'DATABASE_URL',
-      status: 'fail',
-      detail: 'Not set in .env.local or environment',
-      points: 0,
-      maxPoints: 15,
-    });
-  }
+  // Run all checks in parallel
+  const checkPromises: Promise<HealthCheck>[] = [
+    checkProductionUrl(),
+    checkProviderBilling(flags.days),
+  ];
+  if (sentryToken) checkPromises.push(checkSentryErrors(sentryToken, sinceMs));
 
-  // 5. Node.js version check
-  const nodeVersion = process.version;
-  const major = parseInt(nodeVersion.slice(1));
-  if (major >= 18) {
-    checks.push({
-      name: 'Node.js Version',
-      status: 'pass',
-      detail: `${nodeVersion} (18+ required)`,
-      points: 10,
-      maxPoints: 10,
-    });
-  } else {
-    checks.push({
-      name: 'Node.js Version',
-      status: 'fail',
-      detail: `${nodeVersion} — version 18+ required`,
-      points: 0,
-      maxPoints: 10,
-    });
-  }
-
-  console.log('');
+  const asyncChecks = await Promise.all(checkPromises);
+  const syncChecks = [checkGitStatus(), checkDatabaseUrl()];
+  const checks = [...asyncChecks, ...syncChecks];
 
   // Calculate score
-  const totalPoints = checks.reduce((s, c) => s + c.points, 0);
-  const maxPoints = checks.reduce((s, c) => s + c.maxPoints, 0);
-  const score = maxPoints > 0 ? Math.round((totalPoints / maxPoints) * 100) : 0;
+  const scores: number[] = checks.map(c => c.status === 'ok' ? 100 : c.status === 'warning' ? 50 : 0);
+  const overallScore = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
 
-  // JSON output
-  if (showJson) {
-    const jsonPath = path.join(cwd, 'health-report.json');
-    const report = {
-      timestamp: new Date().toISOString(),
-      score,
-      totalPoints,
-      maxPoints,
-      checks: checks.map(c => ({ name: c.name, status: c.status, detail: c.detail, points: c.points, maxPoints: c.maxPoints })),
-    };
-    fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-    console.log(`  ✓ JSON report saved to ${jsonPath}`);
-    console.log('');
+  if (flags.json) {
+    console.log(JSON.stringify({ score: overallScore, checks, lastDeploy }, null, 2));
     return;
   }
 
-  // Display results
-  console.log('┌─────────────────────────────────────────────────────────────┐');
-  console.log(`│  HEALTH SCORE: ${score}/100`.padEnd(62) + '│');
-  console.log('├─────────────────────────────────────────────────────────────┤');
+  const statusLabel = (s: HealthCheck['status']) => {
+    if (s === 'ok') return colorize('OK', 'green');
+    if (s === 'warning') return colorize('WARN', 'yellow');
+    return colorize('ERR', 'red');
+  };
+
+  const lines: string[] = [];
+  if (lastDeploy) {
+    lines.push(colorize(`Since deploy ${lastDeploy.hash} — ${new Date(lastDeploy.time).toLocaleString()}`, 'dim'));
+    lines.push('');
+  }
 
   for (const check of checks) {
-    let icon: string;
-    switch (check.status) {
-      case 'pass': icon = '✓'; break;
-      case 'fail': icon = '✗'; break;
-      case 'warn': icon = '◐'; break;
-      case 'skip': icon = '○'; break;
-    }
-    const pointsStr = `[${check.points}/${check.maxPoints}]`;
-    console.log(`│  ${icon} ${check.name.padEnd(22)} ${pointsStr.padEnd(8)} ${check.detail.slice(0, 24).padEnd(24)} │`);
+    lines.push(`  ${statusLabel(check.status).padEnd(20)} ${check.name.padEnd(22)} ${colorize(check.detail, 'dim')}`);
   }
 
-  console.log('└─────────────────────────────────────────────────────────────┘');
-  console.log('');
+  lines.push('');
+  const scoreColor = overallScore >= 80 ? 'green' : overallScore >= 50 ? 'yellow' : 'red';
+  lines.push(`Score: ${colorize(`${overallScore}/100`, scoreColor)}`);
 
-  // Score interpretation
-  if (score >= 90) {
-    console.log('  ✓ Excellent — production looks healthy');
-  } else if (score >= 70) {
-    console.log('  ◐ Good — some items need attention');
-  } else if (score >= 50) {
-    console.log('  ◐ Fair — review failed checks before shipping');
-  } else {
-    console.log('  ✗ Poor — address critical issues before deploy');
-  }
-  console.log('');
+  box('Health Check', lines.join('\n'));
 }

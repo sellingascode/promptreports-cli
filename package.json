@@ -1,14 +1,15 @@
 {
   "name": "promptreports-cli",
-  "version": "1.1.0",
-  "description": "Vibe Coder Toolkit — 22 developer tools for AI cost tracking, environment sync, codebase analysis, session replay, and ops intelligence across Claude Code, Cursor, Copilot, and 90+ services",
+  "version": "1.2.1",
+  "description": "Vibe coding intelligence — unified ops, cost tracking, environment sync, subprocess filtering, CLAUDE.md slim-down, ghost-token scanning",
   "license": "MIT",
   "author": "PromptReports.ai <hello@promptreports.ai>",
+  "type": "commonjs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sellingascode/promptreports-cli"
+    "url": "git+https://github.com/sellingascode/promptreports-cli.git"
   },
-  "homepage": "https://promptreports.ai",
+  "homepage": "https://github.com/sellingascode/promptreports-cli#readme",
   "bugs": {
     "url": "https://github.com/sellingascode/promptreports-cli/issues"
   },
@@ -30,13 +31,14 @@
     "session-replay",
     "schema-drift",
     "git-intelligence",
-    "cost-attribution"
+    "cost-attribution",
+    "subprocess-filter",
+    "ghost-tokens",
+    "claude-md-optimizer"
   ],
   "bin": {
-    "promptreports": "./dist/cli.js"
+    "promptreports": "./dist/src/cli.js"
   },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "files": [
     "dist/",
     "skills/",
@@ -50,14 +52,13 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "start": "node dist/cli.js",
+    "start": "node dist/src/cli.js",
     "test": "node --test src/**/*.test.ts",
-    "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "@types/node": "^20.0.0"
+    "typescript": "5.4.5",
+    "@types/node": "20.11.4"
   },
   "dependencies": {}
 }

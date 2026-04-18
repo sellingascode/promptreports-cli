@@ -1,288 +1,158 @@
 /**
- * Sessions command — Session replay, search, and history
+ * sessions command — Session replay and history.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { scanClaudeSessions, type SessionStats } from '../scanners/claude-sessions.js';
+import { writeFileSync } from 'node:fs';
+import type { GlobalFlags } from '../cli';
+import { scanProjectSessions, parseSession, analyzeSession, type SessionStats } from '../utils/session-scanner';
+import { colorize, box, table, formatCost, formatTokens, sectionHeader } from '../utils/format';
 
-function fmtCost(n: number): string {
-  return '$' + n.toFixed(2);
-}
+export async function sessionsCommand(flags: GlobalFlags): Promise<void> {
+  const { days, json } = flags;
+  const doList = !flags.args.length || flags.args.includes('--list');
+  const replayId = flags.args.includes('--replay') ? flags.args[flags.args.indexOf('--replay') + 1] : '';
+  const searchTerm = flags.args.includes('--search') ? flags.args[flags.args.indexOf('--search') + 1] : '';
+  const doPatterns = flags.args.includes('--extract-patterns');
+  const exportId = flags.args.includes('--export') ? flags.args[flags.args.indexOf('--export') + 1] : '';
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
-  return n.toLocaleString();
-}
+  // Load all sessions
+  const files = scanProjectSessions(days);
+  const allStats = files.map(f => analyzeSession(parseSession(f), days)).filter(Boolean) as SessionStats[];
+  allStats.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
 
-function truncate(s: string, len: number): string {
-  if (s.length <= len) return s;
-  return s.substring(0, len - 3) + '...';
-}
+  if (replayId) {
+    const session = allStats.find(s => s.sessionId.startsWith(replayId));
+    if (!session) {
+      console.log(colorize(`  Session ${replayId} not found.`, 'red'));
+      return;
+    }
 
-function formatDate(iso: string): string {
-  try {
-    const d = new Date(iso);
-    return d.toISOString().split('T')[0] + ' ' + d.toISOString().split('T')[1].substring(0, 5);
-  } catch {
-    return iso.substring(0, 16);
-  }
-}
+    if (json) { console.log(JSON.stringify(session, null, 2)); return; }
 
-function listSessions(sessions: SessionStats[], showJson: boolean): void {
-  if (sessions.length === 0) {
-    console.log('  No sessions found.');
+    sectionHeader(`Session ${session.sessionId.slice(0, 8)} — ${new Date(session.startedAt).toLocaleDateString()}`);
+    console.log(`  Duration: ${session.sessionDurationMinutes}m | Turns: ${session.turns.length} | Cost: ${formatCost(session.estimatedCostUsd)}`);
+    console.log('');
+
+    for (const turn of session.turns.slice(0, 50)) {
+      const timeStr = new Date(turn.timestamp).toLocaleTimeString();
+      console.log(
+        `  ${colorize(`#${String(turn.turnNumber).padStart(3)}`, 'dim')} ${timeStr}  ` +
+        `${formatTokens(turn.totalTokens).padStart(7)}  ${formatCost(turn.costUsd).padStart(7)}  ` +
+        `${colorize(turn.userPromptPreview.slice(0, 60), 'dim')}`
+      );
+    }
+    if (session.turns.length > 50) console.log(colorize(`  ... and ${session.turns.length - 50} more turns`, 'dim'));
     return;
   }
 
-  if (showJson) {
-    const outPath = path.join(process.cwd(), 'sessions.json');
-    const data = sessions.map(s => ({
-      id: s.sessionId,
-      date: s.startTime,
+  if (searchTerm) {
+    const lower = searchTerm.toLowerCase();
+    const matches = allStats.filter(s =>
+      s.turns.some(t => t.userPromptPreview.toLowerCase().includes(lower))
+    );
+
+    if (json) { console.log(JSON.stringify({ search: searchTerm, results: matches.length, sessions: matches.map(s => ({ id: s.sessionId.slice(0, 8), date: s.startedAt, cost: s.estimatedCostUsd })) }, null, 2)); return; }
+
+    sectionHeader(`Search: "${searchTerm}"`);
+    if (matches.length === 0) {
+      console.log(colorize(`  No sessions found matching "${searchTerm}"`, 'yellow'));
+      return;
+    }
+    const rows = matches.slice(0, 15).map(s => [
+      colorize(s.sessionId.slice(0, 8), 'dim'),
+      new Date(s.startedAt).toLocaleDateString(),
+      String(s.turns.length),
+      formatCost(s.estimatedCostUsd),
+      s.turns.find(t => t.userPromptPreview.toLowerCase().includes(lower))?.userPromptPreview.slice(0, 50) || '',
+    ]);
+    table(['ID', 'Date', 'Turns', 'Cost', 'Match'], rows);
+    return;
+  }
+
+  if (doPatterns) {
+    // Extract recurring patterns
+    const wordFreq: Record<string, number> = {};
+    const fileReads: Record<string, number> = {};
+    let totalTurns = 0;
+    let totalCost = 0;
+
+    for (const s of allStats) {
+      totalTurns += s.turns.length;
+      totalCost += s.estimatedCostUsd;
+      for (const t of s.turns) {
+        const words = t.userPromptPreview.toLowerCase().split(/\s+/);
+        for (const w of words) {
+          if (w.length > 4) wordFreq[w] = (wordFreq[w] || 0) + 1;
+        }
+      }
+    }
+
+    const topWords = Object.entries(wordFreq)
+      .filter(([, c]) => c > 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+
+    if (json) { console.log(JSON.stringify({ sessions: allStats.length, totalTurns, totalCost, avgTurns: totalTurns / Math.max(1, allStats.length), avgCost: totalCost / Math.max(1, allStats.length), topKeywords: topWords }, null, 2)); return; }
+
+    const lines: string[] = [];
+    lines.push(`Sessions: ${allStats.length} | Turns: ${totalTurns} | Total cost: ${formatCost(totalCost)}`);
+    lines.push(`Avg session: ${Math.round(totalTurns / Math.max(1, allStats.length))} turns, ${formatCost(totalCost / Math.max(1, allStats.length))}`);
+    lines.push('');
+    lines.push(colorize('TOP KEYWORDS (recurring tasks):', 'bold'));
+    for (const [word, count] of topWords) {
+      lines.push(`  ${word.padEnd(25)} ${count} occurrences`);
+    }
+
+    box('Session Patterns', lines.join('\n'));
+    return;
+  }
+
+  if (exportId) {
+    const session = allStats.find(s => s.sessionId.startsWith(exportId));
+    if (!session) { console.log(colorize(`  Session ${exportId} not found.`, 'red')); return; }
+
+    const md = [
+      `# Session ${session.sessionId.slice(0, 8)}`,
+      `Date: ${new Date(session.startedAt).toLocaleString()}`,
+      `Duration: ${session.sessionDurationMinutes}m | Cost: ${formatCost(session.estimatedCostUsd)} | Model: ${session.model}`,
+      '',
+      '## Turns',
+      '',
+      ...session.turns.map(t => `### Turn ${t.turnNumber}\n${t.userPromptPreview}\n> Tokens: ${formatTokens(t.totalTokens)} | Cost: ${formatCost(t.costUsd)}\n`),
+    ].join('\n');
+
+    const outPath = `session-${exportId}.md`;
+    writeFileSync(outPath, md);
+    console.log(colorize(`  Exported to ${outPath}`, 'green'));
+    return;
+  }
+
+  // Default: list sessions
+  if (json) {
+    console.log(JSON.stringify(allStats.map(s => ({
+      id: s.sessionId.slice(0, 8),
+      date: s.startedAt,
       turns: s.turns.length,
       cost: s.estimatedCostUsd,
-      tokens: s.totalTokens,
-      firstPrompt: s.turns[0]?.userPromptPreview || '',
-    }));
-    fs.writeFileSync(outPath, JSON.stringify(data, null, 2));
-    console.log(`  ✓ JSON exported to ${outPath}`);
-    return;
-  }
-
-  console.log('  ┌──────────┬──────────────────┬───────┬──────────┬──────────────────────────────┐');
-  console.log('  │ ID       │ Date             │ Turns │ Cost     │ First Prompt                 │');
-  console.log('  ├──────────┼──────────────────┼───────┼──────────┼──────────────────────────────┤');
-
-  for (const s of sessions) {
-    const id = s.sessionId.substring(0, 8);
-    const date = formatDate(s.startTime);
-    const turns = String(s.turns.length).padStart(5);
-    const cost = fmtCost(s.estimatedCostUsd).padStart(8);
-    const firstPrompt = truncate(s.turns[0]?.userPromptPreview || '(no prompt)', 28);
-    console.log(`  │ ${id} │ ${date} │ ${turns} │ ${cost} │ ${firstPrompt.padEnd(28)} │`);
-  }
-
-  console.log('  └──────────┴──────────────────┴───────┴──────────┴──────────────────────────────┘');
-  console.log('');
-  console.log(`  ${sessions.length} sessions total`);
-}
-
-function replaySession(sessions: SessionStats[], id: string): void {
-  const session = sessions.find(s => s.sessionId.startsWith(id));
-  if (!session) {
-    console.log(`  Session matching "${id}" not found.`);
-    console.log('  Use --list to see available sessions.');
-    return;
-  }
-
-  console.log(`  Session: ${session.sessionId}`);
-  console.log(`  Period:  ${formatDate(session.startTime)} → ${formatDate(session.endTime)}`);
-  console.log(`  Cost:    ${fmtCost(session.estimatedCostUsd)}  (${fmtTokens(session.totalTokens)} tokens)`);
-  console.log('');
-  console.log('  ────────────────────────────────────────────────────────────');
-
-  for (const turn of session.turns) {
-    const icon = turn.role === 'user' ? '▸' : '◂';
-    const role = turn.role === 'user' ? 'USER' : 'ASST';
-    const model = turn.model ? ` [${turn.model}]` : '';
-    const cost = turn.costUsd > 0 ? `  ${fmtCost(turn.costUsd)}` : '';
-
-    console.log('');
-    console.log(`  ${icon} ${role}${model}${cost}  (${fmtTokens(turn.totalTokens)} tokens)`);
-    if (turn.userPromptPreview) {
-      console.log(`    ${truncate(turn.userPromptPreview, 76)}`);
-    }
-  }
-
-  console.log('');
-  console.log('  ────────────────────────────────────────────────────────────');
-}
-
-function searchSessions(sessions: SessionStats[], term: string, showJson: boolean): void {
-  const lowerTerm = term.toLowerCase();
-  const matches: Array<{ session: SessionStats; turn: number; preview: string }> = [];
-
-  for (const s of sessions) {
-    for (const t of s.turns) {
-      if (t.userPromptPreview.toLowerCase().includes(lowerTerm)) {
-        matches.push({
-          session: s,
-          turn: t.turnNumber,
-          preview: t.userPromptPreview,
-        });
-      }
-    }
-  }
-
-  if (matches.length === 0) {
-    console.log(`  No results for "${term}".`);
-    return;
-  }
-
-  if (showJson) {
-    const outPath = path.join(process.cwd(), 'sessions-search.json');
-    fs.writeFileSync(outPath, JSON.stringify(matches.map(m => ({
-      sessionId: m.session.sessionId,
-      turn: m.turn,
-      preview: m.preview,
+      model: s.model,
+      summary: s.turns[0]?.userPromptPreview.slice(0, 60) || '',
     })), null, 2));
-    console.log(`  ✓ JSON exported to ${outPath}`);
     return;
   }
 
-  console.log(`  Found ${matches.length} matches for "${term}":`);
-  console.log('');
-
-  for (const m of matches.slice(0, 30)) {
-    console.log(`  ✓ ${m.session.sessionId.substring(0, 8)} turn #${m.turn}`);
-    console.log(`    ${truncate(m.preview, 72)}`);
-  }
-  if (matches.length > 30) {
-    console.log(`  ... and ${matches.length - 30} more`);
-  }
-}
-
-function extractPatterns(sessions: SessionStats[]): void {
-  if (sessions.length === 0) {
-    console.log('  No sessions to analyze.');
+  if (allStats.length === 0) {
+    console.log(colorize(`  No sessions found in the last ${days} days.`, 'yellow'));
     return;
   }
 
-  // Keyword frequency from user prompts
-  const wordCounts = new Map<string, number>();
-  const stopWords = new Set(['the', 'a', 'an', 'is', 'it', 'to', 'and', 'or', 'of', 'in', 'for', 'on', 'with', 'this', 'that', 'i', 'me', 'my', 'we', 'you', 'can', 'do', 'be', 'at', 'as', 'by', 'from', 'not', 'but', 'if', 'so', 'no', 'up']);
+  const rows = allStats.slice(0, 20).map(s => [
+    colorize(s.sessionId.slice(0, 8), 'dim'),
+    new Date(s.startedAt).toLocaleDateString(),
+    String(s.turns.length),
+    formatCost(s.estimatedCostUsd),
+    (s.turns[0]?.userPromptPreview || '').slice(0, 50),
+  ]);
 
-  let totalTurns = 0;
-  let totalCost = 0;
-  let totalTokens = 0;
-
-  for (const s of sessions) {
-    totalTurns += s.turns.length;
-    totalCost += s.estimatedCostUsd;
-    totalTokens += s.totalTokens;
-
-    for (const t of s.turns) {
-      if (t.role !== 'user') continue;
-      const words = t.userPromptPreview.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/);
-      for (const w of words) {
-        if (w.length < 3 || stopWords.has(w)) continue;
-        wordCounts.set(w, (wordCounts.get(w) || 0) + 1);
-      }
-    }
-  }
-
-  const topWords = Array.from(wordCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 15);
-
-  const avgTurns = totalTurns / sessions.length;
-  const avgCost = totalCost / sessions.length;
-  const avgTokens = totalTokens / sessions.length;
-
-  console.log('  ┌─────────────────────────────────────────────────────────┐');
-  console.log('  │  SESSION PATTERNS'.padEnd(60) + '│');
-  console.log('  ├─────────────────────────────────────────────────────────┤');
-  console.log(`  │  Sessions:    ${sessions.length}`.padEnd(60) + '│');
-  console.log(`  │  Avg turns:   ${avgTurns.toFixed(1)}`.padEnd(60) + '│');
-  console.log(`  │  Avg cost:    ${fmtCost(avgCost)}`.padEnd(60) + '│');
-  console.log(`  │  Avg tokens:  ${fmtTokens(Math.round(avgTokens))}`.padEnd(60) + '│');
-  console.log('  └─────────────────────────────────────────────────────────┘');
-  console.log('');
-
-  if (topWords.length > 0) {
-    console.log('  Top keywords:');
-    for (const [word, count] of topWords) {
-      const bar = '█'.repeat(Math.min(30, Math.round(count / topWords[0][1] * 30)));
-      console.log(`    ${word.padEnd(15)} ${String(count).padStart(4)}  ${bar}`);
-    }
-  }
-}
-
-function exportSession(sessions: SessionStats[], id: string): void {
-  const session = sessions.find(s => s.sessionId.startsWith(id));
-  if (!session) {
-    console.log(`  Session matching "${id}" not found.`);
-    return;
-  }
-
-  const lines: string[] = [];
-  lines.push(`# Session ${session.sessionId}`);
-  lines.push('');
-  lines.push(`**Date:** ${formatDate(session.startTime)} - ${formatDate(session.endTime)}`);
-  lines.push(`**Turns:** ${session.turns.length}`);
-  lines.push(`**Cost:** ${fmtCost(session.estimatedCostUsd)}`);
-  lines.push(`**Tokens:** ${fmtTokens(session.totalTokens)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const turn of session.turns) {
-    const role = turn.role === 'user' ? 'User' : 'Assistant';
-    const model = turn.model ? ` (${turn.model})` : '';
-    lines.push(`### Turn ${turn.turnNumber} — ${role}${model}`);
-    lines.push('');
-    if (turn.userPromptPreview) {
-      lines.push(`> ${turn.userPromptPreview}`);
-    }
-    lines.push('');
-    lines.push(`Tokens: ${fmtTokens(turn.totalTokens)} | Cost: ${fmtCost(turn.costUsd)}`);
-    lines.push('');
-  }
-
-  const filename = `session-${session.sessionId.substring(0, 8)}.md`;
-  const outPath = path.join(process.cwd(), filename);
-  fs.writeFileSync(outPath, lines.join('\n'));
-  console.log(`  ✓ Exported to ${outPath}`);
-}
-
-export async function sessions(args: string[]): Promise<void> {
-  const showJson = args.includes('--json');
-  const daysIdx = args.indexOf('--days');
-  const days = daysIdx >= 0 ? parseInt(args[daysIdx + 1]) || 7 : 7;
-
-  const doReplay = args.includes('--replay');
-  const replayIdx = args.indexOf('--replay');
-  const replayId = replayIdx >= 0 ? args[replayIdx + 1] : null;
-
-  const doSearch = args.includes('--search');
-  const searchIdx = args.indexOf('--search');
-  const searchTerm = searchIdx >= 0 ? args[searchIdx + 1] : null;
-
-  const doPatterns = args.includes('--extract-patterns');
-
-  const doExport = args.includes('--export');
-  const exportIdx = args.indexOf('--export');
-  const exportId = exportIdx >= 0 ? args[exportIdx + 1] : null;
-
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  SESSION HISTORY                                            ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
-
-  const allSessions = scanClaudeSessions(days);
-  if (allSessions.length === 0) {
-    console.log('  No Claude Code sessions found in the last ' + days + ' days.');
-    console.log('  Try: --days 30');
-    return;
-  }
-
-  console.log(`  Found ${allSessions.length} sessions (last ${days} days)`);
-  console.log('');
-
-  if (doReplay && replayId) {
-    replaySession(allSessions, replayId);
-  } else if (doSearch && searchTerm) {
-    searchSessions(allSessions, searchTerm, showJson);
-  } else if (doPatterns) {
-    extractPatterns(allSessions);
-  } else if (doExport && exportId) {
-    exportSession(allSessions, exportId);
-  } else {
-    listSessions(allSessions, showJson);
-  }
-
-  console.log('');
+  table(['ID', 'Date', 'Turns', 'Cost', 'Summary'], rows);
+  if (allStats.length > 20) console.log(colorize(`  ... and ${allStats.length - 20} more sessions`, 'dim'));
 }

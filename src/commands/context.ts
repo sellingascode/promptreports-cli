@@ -1,256 +1,386 @@
 /**
- * Context command — Context window optimizer
+ * context command — Context window optimizer.
+ * Analyzes what's consuming Claude Code's context budget across sessions.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
-import { scanClaudeSessions, type SessionStats } from '../scanners/claude-sessions.js';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import type { GlobalFlags } from '../cli';
+import { scanProjectSessions, parseSession, analyzeSession } from '../utils/session-scanner';
+import { colorize, box, formatTokens, formatCost, progressBar } from '../utils/format';
 
-const CONTEXT_BUDGET = 200_000;
-const SYSTEM_PROMPT_TOKENS = 6_200;
-const SKILL_TOKENS_ESTIMATE = 300;
-
-function charsToTokens(chars: number): number {
-  return Math.ceil(chars / 4);
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
-  return n.toLocaleString();
+function getClaudeMdSize(cwd: string): number {
+  const path = join(cwd, 'CLAUDE.md');
+  try { return estimateTokens(readFileSync(path, 'utf-8')); } catch { return 0; }
 }
 
-function pct(n: number, total: number): string {
-  if (total === 0) return '0%';
-  return Math.round((n / total) * 100) + '%';
-}
-
-function countSkills(cwd: string): { count: number; names: string[] } {
-  const skillsDir = path.join(cwd, '.claude', 'skills');
-  if (!fs.existsSync(skillsDir)) return { count: 0, names: [] };
-
+function getSkillCount(cwd: string): { count: number; totalTokens: number; names: string[] } {
+  const dir = join(cwd, '.claude', 'skills');
+  if (!existsSync(dir)) return { count: 0, totalTokens: 0, names: [] };
+  const names: string[] = [];
+  let totalTokens = 0;
   try {
-    const dirs = fs.readdirSync(skillsDir).filter(d => {
-      try { return fs.statSync(path.join(skillsDir, d)).isDirectory(); } catch { return false; }
-    });
-    return { count: dirs.length, names: dirs };
-  } catch {
-    return { count: 0, names: [] };
-  }
-}
-
-function countMemoryFiles(): { count: number; totalTokens: number } {
-  const memoryDir = path.join(os.homedir(), '.claude', 'memory');
-  if (!fs.existsSync(memoryDir)) return { count: 0, totalTokens: 0 };
-
-  try {
-    const files = fs.readdirSync(memoryDir).filter(f => f.endsWith('.md') || f.endsWith('.txt'));
-    let totalChars = 0;
-    for (const file of files) {
-      try {
-        const stat = fs.statSync(path.join(memoryDir, file));
-        totalChars += stat.size;
-      } catch {}
-    }
-    return { count: files.length, totalTokens: charsToTokens(totalChars) };
-  } catch {
-    return { count: 0, totalTokens: 0 };
-  }
-}
-
-function getClaudeMdTokens(cwd: string): number {
-  const claudeMd = path.join(cwd, 'CLAUDE.md');
-  if (!fs.existsSync(claudeMd)) return 0;
-  try {
-    const content = fs.readFileSync(claudeMd, 'utf-8');
-    return charsToTokens(content.length);
-  } catch {
-    return 0;
-  }
-}
-
-function findCompactionEvents(sessions: SessionStats[]): Array<{ sessionId: string; turnNumber: number; dropPercent: number; timestamp: string }> {
-  const events: Array<{ sessionId: string; turnNumber: number; dropPercent: number; timestamp: string }> = [];
-
-  for (const session of sessions) {
-    let runningTotal = 0;
-    let peakTotal = 0;
-
-    for (const turn of session.turns) {
-      runningTotal += turn.totalTokens;
-      if (runningTotal > peakTotal) peakTotal = runningTotal;
-
-      // Detect compaction: cumulative tokens drop significantly from peak
-      // A compaction resets the context, so input tokens will drop sharply
-      if (turn.inputTokens > 0 && peakTotal > 50000) {
-        // If this turn's input is less than 60% of peak, likely a compaction
-        if (turn.inputTokens < peakTotal * 0.6 && peakTotal > 100000) {
-          const dropPercent = Math.round((1 - turn.inputTokens / peakTotal) * 100);
-          if (dropPercent >= 40) {
-            events.push({
-              sessionId: session.sessionId,
-              turnNumber: turn.turnNumber,
-              dropPercent,
-              timestamp: turn.timestamp,
-            });
-            // Reset peak after compaction
-            peakTotal = turn.inputTokens;
-            runningTotal = turn.inputTokens;
-          }
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        const skillPath = join(dir, entry.name, 'SKILL.md');
+        if (existsSync(skillPath)) {
+          names.push(entry.name);
+          totalTokens += estimateTokens(readFileSync(skillPath, 'utf-8'));
         }
       }
     }
+  } catch { /* */ }
+  return { count: names.length, totalTokens, names };
+}
+
+function getMemoryFiles(cwd: string): { count: number; totalTokens: number } {
+  // Check both project-level and global memory
+  const dirs = [
+    join(cwd, '.claude', 'memory'),
+    join(homedir(), '.claude', 'memory'),
+  ];
+  let count = 0, totalTokens = 0;
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    try {
+      for (const f of readdirSync(dir)) {
+        if (f.endsWith('.md')) {
+          count++;
+          totalTokens += estimateTokens(readFileSync(join(dir, f), 'utf-8'));
+        }
+      }
+    } catch { /* */ }
+  }
+  return { count, totalTokens };
+}
+
+interface GhostFinding {
+  kind: 'duplicate-tool-result' | 'oversize-tool-schema' | 'post-compaction-waste' | 'unused-skill' | 'stale-claude-md';
+  severity: 'high' | 'medium' | 'low';
+  description: string;
+  tokensWasted: number;
+  evidence: string;
+}
+
+function ghostScan(cwd: string, days: number): { findings: GhostFinding[]; totalWaste: number; sessionsScanned: number } {
+  const files = scanProjectSessions(days);
+  const findings: GhostFinding[] = [];
+
+  // 1. Unused skills (reuses existing logic, rebuilt here for isolation)
+  const skills = getSkillCount(cwd);
+  const sessionTexts: string[] = [];
+  const toolResultHashes = new Map<string, { count: number; size: number }>();
+  const toolSchemaSizes = new Map<string, number>();
+  let postCompactionLines = 0;
+
+  for (const file of files) {
+    let raw: string;
+    try { raw = readFileSync(file, 'utf-8'); } catch { continue; }
+    sessionTexts.push(raw);
+
+    const lines = raw.split('\n');
+    let prevCumulativeSize = 0;
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let entry: any;
+      try { entry = JSON.parse(line); } catch { continue; }
+
+      // Tool results — dedupe by content hash
+      if (entry.type === 'user' && Array.isArray(entry.message?.content)) {
+        for (const block of entry.message.content) {
+          if (block.type === 'tool_result') {
+            const txt = typeof block.content === 'string'
+              ? block.content
+              : Array.isArray(block.content)
+                ? block.content.map((c: any) => c.text || '').join('')
+                : '';
+            if (txt.length < 200) continue;
+            // Cheap content fingerprint: length + first/last 60 chars
+            const hash = `${txt.length}:${txt.slice(0, 60)}:${txt.slice(-60)}`;
+            const cur = toolResultHashes.get(hash) || { count: 0, size: estimateTokens(txt) };
+            cur.count++;
+            toolResultHashes.set(hash, cur);
+          }
+        }
+      }
+
+      // Tool schema size (assistant messages with tool_use)
+      if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
+        for (const block of entry.message.content) {
+          if (block.type === 'tool_use' && block.name) {
+            const existing = toolSchemaSizes.get(block.name) || 0;
+            const inputSize = JSON.stringify(block.input || {}).length;
+            toolSchemaSizes.set(block.name, Math.max(existing, inputSize));
+          }
+        }
+      }
+
+      // Post-compaction waste heuristic: sudden token drops signal compaction;
+      // count how much content is preserved that could have been dropped further
+      const cumulative = entry.message?.usage?.input_tokens || 0;
+      if (prevCumulativeSize > 10000 && cumulative < prevCumulativeSize * 0.5 && cumulative > 3000) {
+        postCompactionLines += Math.floor((cumulative - 3000) / 4); // rough token est
+      }
+      if (cumulative > 0) prevCumulativeSize = cumulative;
+    }
   }
 
-  return events;
+  // Convert duplicates to findings
+  let totalDupeWaste = 0;
+  let dupeCount = 0;
+  for (const [hash, info] of toolResultHashes) {
+    if (info.count >= 3) {
+      const wasted = info.size * (info.count - 1);
+      totalDupeWaste += wasted;
+      dupeCount++;
+    }
+  }
+  if (dupeCount > 0) {
+    findings.push({
+      kind: 'duplicate-tool-result',
+      severity: totalDupeWaste > 5000 ? 'high' : 'medium',
+      description: `${dupeCount} tool results repeated 3+ times across sessions`,
+      tokensWasted: totalDupeWaste,
+      evidence: `Same large tool output (file reads, API responses) appearing repeatedly. Cache these results or reference them by path.`,
+    });
+  }
+
+  // Oversize tool schemas
+  const largeSchemas = Array.from(toolSchemaSizes.entries()).filter(([, size]) => size > 4000);
+  if (largeSchemas.length > 0) {
+    const totalSchemaWaste = largeSchemas.reduce((a, [, s]) => a + Math.floor(s / 4 * 0.3), 0);
+    findings.push({
+      kind: 'oversize-tool-schema',
+      severity: 'medium',
+      description: `${largeSchemas.length} tool(s) with oversized input payloads`,
+      tokensWasted: totalSchemaWaste,
+      evidence: `Tools: ${largeSchemas.slice(0, 3).map(([n]) => n).join(', ')}${largeSchemas.length > 3 ? '…' : ''}. Long inputs suggest agents are pasting content that could be referenced.`,
+    });
+  }
+
+  // Post-compaction waste
+  if (postCompactionLines > 500) {
+    findings.push({
+      kind: 'post-compaction-waste',
+      severity: 'medium',
+      description: `Post-compaction residue across sessions`,
+      tokensWasted: postCompactionLines,
+      evidence: `Compaction events kept more than necessary. Break sessions earlier (turn 15-18) to avoid compacting in the first place.`,
+    });
+  }
+
+  // Unused skills
+  const combinedText = sessionTexts.join(' ').toLowerCase();
+  const unusedSkills: string[] = [];
+  for (const name of skills.names) {
+    if (!combinedText.includes(name.toLowerCase()) && !combinedText.includes('/' + name.toLowerCase())) {
+      unusedSkills.push(name);
+    }
+  }
+  if (unusedSkills.length > 0) {
+    const skillWaste = unusedSkills.length * 300;
+    findings.push({
+      kind: 'unused-skill',
+      severity: unusedSkills.length >= 5 ? 'medium' : 'low',
+      description: `${unusedSkills.length} skill(s) loaded but never invoked in last ${days} days`,
+      tokensWasted: skillWaste,
+      evidence: `Never referenced: ${unusedSkills.slice(0, 4).join(', ')}${unusedSkills.length > 4 ? '…' : ''}. Each costs ~300 tokens/session.`,
+    });
+  }
+
+  // Stale CLAUDE.md content
+  const claudeMd = getClaudeMdSize(cwd);
+  if (claudeMd > 2000) {
+    findings.push({
+      kind: 'stale-claude-md',
+      severity: claudeMd > 5000 ? 'high' : 'low',
+      description: `CLAUDE.md is ${claudeMd} tokens — loaded on every turn`,
+      tokensWasted: Math.max(0, claudeMd - 1500),
+      evidence: `Deep analysis available via: promptreports audit claude-md`,
+    });
+  }
+
+  const totalWaste = findings.reduce((a, f) => a + f.tokensWasted, 0);
+  return { findings, totalWaste, sessionsScanned: files.length };
 }
 
-function findUnusedSkills(sessions: SessionStats[], skillNames: string[]): string[] {
-  if (skillNames.length === 0) return [];
-
-  // Collect all user prompt text from sessions
-  const allText = sessions
-    .flatMap(s => s.turns)
-    .filter(t => t.userPromptPreview)
-    .map(t => t.userPromptPreview.toLowerCase())
-    .join(' ');
-
-  return skillNames.filter(name => {
-    const lower = name.toLowerCase().replace(/-/g, ' ');
-    const kebab = name.toLowerCase();
-    return !allText.includes(lower) && !allText.includes(kebab);
-  });
-}
-
-export async function context(args: string[]): Promise<void> {
-  const showJson = args.includes('--json');
-  const daysIdx = args.indexOf('--days');
-  const days = daysIdx >= 0 ? parseInt(args[daysIdx + 1]) || 7 : 7;
-
+export async function contextCommand(flags: GlobalFlags): Promise<void> {
   const cwd = process.cwd();
+  const { days } = flags;
 
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  CONTEXT WINDOW OPTIMIZER                                    ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
+  if (flags.args.includes('--ghosts')) {
+    const { findings, totalWaste, sessionsScanned } = ghostScan(cwd, days);
+    const dailyWaste = totalWaste / Math.max(1, days);
+    const costPerSession = (totalWaste / 1e6) * 15; // input pricing
+    const monthlyCost = costPerSession * (sessionsScanned / Math.max(1, days)) * 30;
 
-  // 1. CLAUDE.md size
-  const claudeMdTokens = getClaudeMdTokens(cwd);
-
-  // 2. Skills count
-  const skills = countSkills(cwd);
-  const skillsTokens = skills.count * SKILL_TOKENS_ESTIMATE;
-
-  // 3. Memory files
-  const memory = countMemoryFiles();
-
-  // 4. System prompt
-  const systemTokens = SYSTEM_PROMPT_TOKENS;
-
-  // 5. Total startup cost
-  const startupTokens = claudeMdTokens + skillsTokens + memory.totalTokens + systemTokens;
-  const remainingTokens = CONTEXT_BUDGET - startupTokens;
-  const usedPercent = Math.round((startupTokens / CONTEXT_BUDGET) * 100);
-
-  // Display budget
-  console.log('┌─────────────────────────────────────────────────────────────┐');
-  console.log('│  CONTEXT BUDGET (200K tokens)                               │');
-  console.log('├─────────────────────────────────────────────────────────────┤');
-  console.log(`│  System prompt:       ${fmtTokens(systemTokens).padStart(8)}  tokens`.padEnd(62) + '│');
-  console.log(`│  CLAUDE.md:           ${fmtTokens(claudeMdTokens).padStart(8)}  tokens`.padEnd(62) + '│');
-  console.log(`│  Skills (${skills.count}):`.padEnd(24) + `${fmtTokens(skillsTokens).padStart(8)}  tokens  (~${SKILL_TOKENS_ESTIMATE}/skill)`.padEnd(38) + '│');
-  console.log(`│  Memory files (${memory.count}):`.padEnd(24) + `${fmtTokens(memory.totalTokens).padStart(8)}  tokens`.padEnd(38) + '│');
-  console.log('├─────────────────────────────────────────────────────────────┤');
-  console.log(`│  Startup cost:        ${fmtTokens(startupTokens).padStart(8)}  tokens  (${usedPercent}% of budget)`.padEnd(62) + '│');
-  console.log(`│  Available for work:  ${fmtTokens(remainingTokens).padStart(8)}  tokens  (${100 - usedPercent}% remaining)`.padEnd(62) + '│');
-  console.log('└─────────────────────────────────────────────────────────────┘');
-  console.log('');
-
-  // 6. Scan sessions for compaction events
-  const sessions = scanClaudeSessions(days);
-
-  if (sessions.length > 0) {
-    const compactions = findCompactionEvents(sessions);
-    if (compactions.length > 0) {
-      console.log(`  ◐ ${compactions.length} compaction events detected in last ${days} days`);
-      console.log('    Compaction means context hit the limit — sessions were truncated');
-      for (const evt of compactions.slice(0, 5)) {
-        const sessionShort = evt.sessionId.slice(0, 8);
-        const date = evt.timestamp ? new Date(evt.timestamp).toLocaleDateString() : 'unknown';
-        console.log(`    → Session ${sessionShort}… turn ${evt.turnNumber} — ${evt.dropPercent}% drop (${date})`);
-      }
-      if (compactions.length > 5) {
-        console.log(`    … and ${compactions.length - 5} more`);
-      }
-    } else {
-      console.log(`  ✓ No compaction events detected in last ${days} days`);
+    if (flags.json) {
+      console.log(JSON.stringify({ findings, totalWaste, dailyWaste, sessionsScanned, estimatedMonthlyCost: monthlyCost }, null, 2));
+      return;
     }
 
-    // 7. Find unused skills
-    const unused = findUnusedSkills(sessions, skills.names);
-    if (unused.length > 0) {
+    box('Ghost Token Scan', [
+      `Scanned:        ${sessionsScanned} session files (last ${days} days)`,
+      `Total waste:    ${colorize(formatTokens(totalWaste) + ' tokens', totalWaste > 5000 ? 'red' : 'yellow')}`,
+      `Daily avg:      ${formatTokens(Math.round(dailyWaste))} tokens/day of silent bloat`,
+      `Est. cost:      ${colorize(formatCost(monthlyCost) + '/month', 'yellow')} just on ghosts`,
+    ].join('\n'));
+
+    if (findings.length === 0) {
+      console.log(colorize('\n  No ghost tokens detected. Context is clean.', 'green'));
+      return;
+    }
+
+    console.log('');
+    const sorted = findings.slice().sort((a, b) => b.tokensWasted - a.tokensWasted);
+    for (const f of sorted) {
+      const sev = f.severity === 'high' ? colorize('HIGH  ', 'red')
+        : f.severity === 'medium' ? colorize('MED   ', 'yellow')
+        : colorize('LOW   ', 'dim');
+      console.log(`  ${sev} ${colorize(f.description, 'bold')}  ${colorize(`~${formatTokens(f.tokensWasted)} tokens`, 'green')}`);
+      console.log(`         ${colorize(f.evidence, 'dim')}`);
       console.log('');
-      console.log(`  ◐ ${unused.length} skills not referenced in recent sessions:`);
-      for (const name of unused.slice(0, 10)) {
-        console.log(`    ○ ${name}  (~${SKILL_TOKENS_ESTIMATE} tokens saved if removed)`);
-      }
-      if (unused.length > 10) {
-        console.log(`    … and ${unused.length - 10} more`);
-      }
-      const savingsTokens = unused.length * SKILL_TOKENS_ESTIMATE;
-      console.log(`    Total potential savings: ${fmtTokens(savingsTokens)} tokens/turn`);
-    } else if (skills.count > 0) {
-      console.log(`  ✓ All ${skills.count} skills were referenced in recent sessions`);
     }
-  } else {
-    console.log('  ○ No sessions found — skipping compaction and usage analysis');
+    return;
   }
 
-  console.log('');
+  // Analyze static context consumers
+  const claudeMdTokens = getClaudeMdSize(cwd);
+  const skills = getSkillCount(cwd);
+  const memory = getMemoryFiles(cwd);
+  const systemPromptEstimate = 6200; // Approximate system prompt size
 
-  // Recommendations
-  const recs: string[] = [];
-  if (claudeMdTokens > 5000) {
-    recs.push(`Trim CLAUDE.md (${fmtTokens(claudeMdTokens)} → ~2K tokens) — it loads every turn`);
-  }
-  if (skills.count > 20) {
-    recs.push(`Review ${skills.count} skills — remove unused ones to free context`);
-  }
-  if (usedPercent > 15) {
-    recs.push(`Startup uses ${usedPercent}% of context — consider reducing to <10%`);
-  }
+  const startupTokens = claudeMdTokens + skills.totalTokens + memory.totalTokens + systemPromptEstimate;
+  const contextBudget = 200000;
+  const startupPercent = (startupTokens / contextBudget) * 100;
 
-  if (recs.length > 0) {
-    console.log('  Recommendations:');
-    for (const rec of recs) {
-      console.log(`    → ${rec}`);
+  // Analyze sessions for usage patterns
+  const files = scanProjectSessions(days);
+  const allStats = files.map(f => analyzeSession(parseSession(f), days)).filter(Boolean) as any[];
+
+  // Find compaction events (sudden token drops between consecutive turns)
+  let compactionCount = 0;
+  let firstCompactionTurn = 0;
+  const fileReadCounts: Record<string, number> = {};
+
+  for (const stats of allStats) {
+    let prevCumulative = 0;
+    for (const turn of stats.turns) {
+      if (prevCumulative > 0 && turn.cumulativeTokens < prevCumulative * 0.6) {
+        compactionCount++;
+        if (firstCompactionTurn === 0) firstCompactionTurn = turn.turnNumber;
+      }
+      prevCumulative = turn.cumulativeTokens;
+
+      // Track file reads from user prompt previews
+      const preview = turn.userPromptPreview || '';
+      const fileMatch = preview.match(/(?:Read|read|cat)\s+([^\s]+)/);
+      if (fileMatch) {
+        const file = fileMatch[1];
+        fileReadCounts[file] = (fileReadCounts[file] || 0) + 1;
+      }
     }
-    console.log('');
   }
 
-  // JSON output
-  if (showJson) {
-    const jsonPath = path.join(cwd, 'context-report.json');
-    const report = {
-      timestamp: new Date().toISOString(),
-      budget: CONTEXT_BUDGET,
-      startup: {
-        systemPrompt: systemTokens,
-        claudeMd: claudeMdTokens,
-        skills: { count: skills.count, tokens: skillsTokens },
-        memory: { count: memory.count, tokens: memory.totalTokens },
-        total: startupTokens,
-        percentUsed: usedPercent,
-      },
-      remaining: remainingTokens,
-      compactionEvents: sessions.length > 0 ? findCompactionEvents(sessions).length : null,
-      unusedSkills: sessions.length > 0 ? findUnusedSkills(sessions, skills.names) : null,
-      recommendations: recs,
-    };
-    fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-    console.log(`  ✓ JSON report saved to ${jsonPath}`);
-    console.log('');
+  // Find skills that were never invoked (rough: check if skill name appears in session content)
+  const unusedSkills: string[] = [];
+  const sessionContent = allStats.map(s => s.turns.map((t: any) => t.userPromptPreview).join(' ')).join(' ').toLowerCase();
+  for (const skillName of skills.names) {
+    if (!sessionContent.includes(skillName.toLowerCase()) && !sessionContent.includes('/' + skillName.toLowerCase())) {
+      unusedSkills.push(skillName);
+    }
   }
+  const unusedSkillTokens = unusedSkills.length * 300; // rough estimate
+
+  // Average session metrics
+  const avgTurns = allStats.length > 0 ? allStats.reduce((a: number, s: any) => a + s.turns.length, 0) / allStats.length : 0;
+  const avgCost = allStats.length > 0 ? allStats.reduce((a: number, s: any) => a + s.estimatedCostUsd, 0) / allStats.length : 0;
+
+  // Top file reads
+  const topReads = Object.entries(fileReadCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  if (flags.json) {
+    console.log(JSON.stringify({
+      contextBudget,
+      startupTokens,
+      startupPercent,
+      claudeMdTokens,
+      skillTokens: skills.totalTokens,
+      skillCount: skills.count,
+      memoryTokens: memory.totalTokens,
+      memoryCount: memory.count,
+      systemPromptEstimate,
+      unusedSkills,
+      unusedSkillTokens,
+      compactionCount,
+      firstCompactionTurn,
+      avgTurns,
+      avgCost,
+      topReads,
+      sessions: allStats.length,
+    }, null, 2));
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push(`${colorize('CONTEXT BUDGET:', 'bold')} ${formatTokens(contextBudget)} tokens`);
+  lines.push(`${colorize('USED AT START:', 'bold')}  ${formatTokens(startupTokens)} tokens (${startupPercent.toFixed(1)}%)`);
+  lines.push(`  ${progressBar(startupPercent, 40)}`);
+  lines.push('');
+  lines.push(colorize('BIGGEST CONSUMERS (at session start):', 'bold'));
+  const consumers = [
+    { name: 'CLAUDE.md', tokens: claudeMdTokens },
+    { name: `Skills (${skills.count} loaded)`, tokens: skills.totalTokens },
+    { name: 'System prompt', tokens: systemPromptEstimate },
+    { name: `Memory files (${memory.count})`, tokens: memory.totalTokens },
+  ].sort((a, b) => b.tokens - a.tokens);
+
+  for (const c of consumers) {
+    const pct = ((c.tokens / startupTokens) * 100).toFixed(0);
+    lines.push(`  ${c.name.padEnd(28)} ${formatTokens(c.tokens).padStart(8)} (${pct}%)`);
+  }
+
+  if (unusedSkills.length > 0) {
+    lines.push('');
+    lines.push(colorize(`SKILLS NEVER INVOKED (last ${days} days):`, 'bold'));
+    for (const s of unusedSkills.slice(0, 5)) {
+      lines.push(`  ${colorize('-', 'dim')} ${s}`);
+    }
+    if (unusedSkills.length > 5) lines.push(colorize(`  ... and ${unusedSkills.length - 5} more`, 'dim'));
+    lines.push(`  ${colorize(`Removing saves ~${formatTokens(unusedSkillTokens)} tokens/session`, 'yellow')}`);
+  }
+
+  if (topReads.length > 0) {
+    lines.push('');
+    lines.push(colorize(`FILES READ MOST OFTEN (across ${allStats.length} sessions):`, 'bold'));
+    for (const [file, count] of topReads) {
+      lines.push(`  ${file.padEnd(45)} ${count} reads`);
+    }
+  }
+
+  if (compactionCount > 0) {
+    lines.push('');
+    lines.push(colorize('COMPACTION EVENTS:', 'bold'));
+    lines.push(`  ${compactionCount} compactions across ${allStats.length} sessions`);
+    if (firstCompactionTurn > 0) lines.push(`  First compaction at turn ${firstCompactionTurn}`);
+    lines.push(`  ${colorize('Tip: break sessions at turn 15-18 to avoid context loss', 'yellow')}`);
+  }
+
+  if (avgCost > 0) {
+    lines.push('');
+    const savingsPerSession = (unusedSkillTokens / 1e6) * 15; // input pricing
+    const dailySavings = savingsPerSession * (allStats.length / Math.max(1, days));
+    lines.push(`Avg session: ${Math.round(avgTurns)} turns, ${formatCost(avgCost)}`);
+    if (dailySavings > 0.01) lines.push(`Estimated savings: ${colorize(formatCost(dailySavings) + '/day', 'green')} if you apply optimizations`);
+  }
+
+  box('Context Window Analysis', lines.join('\n'));
 }

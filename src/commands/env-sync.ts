@@ -1,224 +1,215 @@
 /**
- * Env Sync command — Compare .env.local vs Vercel environment variables
+ * env sync command — Environment variable sync between local, Vercel, Railway.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { GlobalFlags } from '../cli';
+import { parseEnvFile, discoverServices } from '../../fetchers/env-discovery';
+import { colorize, statusIcon, box, table } from '../utils/format';
 
-interface EnvEntry {
+interface EnvVar {
   key: string;
-  local: boolean;
-  vercel: boolean;
-  status: 'healthy' | 'missing-vercel' | 'missing-local' | 'drift';
+  localValue: string;
+  vercelValue: string;
+  status: 'healthy' | 'missing-local' | 'missing-remote' | 'drift' | 'dead';
 }
 
-function parseEnvFile(filePath: string): Record<string, string> {
-  const vars: Record<string, string> = {};
-  if (!fs.existsSync(filePath)) return vars;
-
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx === -1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
-      if (key) vars[key] = val;
-    }
-  } catch {}
-
-  return vars;
-}
-
-function getVercelProjectId(cwd: string): string | null {
-  // Check .vercel/project.json
-  const vercelProjectPath = path.join(cwd, '.vercel', 'project.json');
-  if (fs.existsSync(vercelProjectPath)) {
+async function fetchVercelEnvVars(token: string): Promise<Record<string, string>> {
+  const projectId = process.env.VERCEL_PROJECT_ID || '';
+  if (!projectId) {
+    // Try reading .vercel/project.json
     try {
-      const content = JSON.parse(fs.readFileSync(vercelProjectPath, 'utf-8'));
-      if (content.projectId) return content.projectId;
-    } catch {}
+      const vercelConfig = JSON.parse(readFileSync(join(process.cwd(), '.vercel', 'project.json'), 'utf-8'));
+      if (vercelConfig.projectId) {
+        return fetchVercelEnvVarsById(token, vercelConfig.projectId);
+      }
+    } catch { /* */ }
+    return {};
   }
-
-  // Check env for VERCEL_PROJECT_ID
-  const envPath = path.join(cwd, '.env.local');
-  const envVars = parseEnvFile(envPath);
-  if (envVars['VERCEL_PROJECT_ID']) return envVars['VERCEL_PROJECT_ID'];
-
-  return null;
+  return fetchVercelEnvVarsById(token, projectId);
 }
 
-async function fetchVercelEnv(token: string, projectId: string): Promise<Record<string, boolean>> {
-  const url = `https://api.vercel.com/v9/projects/${projectId}/env`;
+async function fetchVercelEnvVarsById(token: string, projectId: string): Promise<Record<string, string>> {
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`https://api.vercel.com/v9/projects/${projectId}/env`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) {
-      console.log(`  ✗ Vercel API returned ${res.status}: ${res.statusText}`);
-      return {};
-    }
-    const data = await res.json() as { envs?: Array<{ key: string }> };
-    const keys: Record<string, boolean> = {};
-    if (data.envs) {
-      for (const env of data.envs) {
-        keys[env.key] = true;
+    if (!res.ok) return {};
+    const data = await res.json();
+    const vars: Record<string, string> = {};
+    for (const env of data.envs || []) {
+      if (env.target?.includes('production') || env.target?.includes('development')) {
+        vars[env.key] = env.value || '(encrypted)';
       }
     }
-    return keys;
-  } catch (err: any) {
-    console.log(`  ✗ Failed to fetch Vercel env: ${err.message}`);
+    return vars;
+  } catch {
     return {};
   }
 }
 
-export async function envSync(args: string[]): Promise<void> {
-  const showDiff = args.includes('--diff');
-  const showMerge = args.includes('--merge');
-  const showBackup = args.includes('--backup');
-  const showJson = args.includes('--json');
+async function fetchRailwayEnvVars(token: string): Promise<Record<string, string>> {
+  try {
+    const res = await fetch('https://backboard.railway.app/graphql/v2', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: `query { me { projects { edges { node { name services { edges { node { name serviceInstanceId } } } } } } } }`,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return {};
+    // Railway doesn't expose env vars directly via this query — flag for future
+    return {};
+  } catch {
+    return {};
+  }
+}
 
+export async function envSyncCommand(flags: GlobalFlags): Promise<void> {
   const cwd = process.cwd();
-  const envPath = path.join(cwd, '.env.local');
+  const envPath = join(cwd, '.env.local');
+  const hasFrom = flags.args.includes('--from');
+  const hasDiff = flags.args.includes('--diff');
+  const hasBackup = flags.args.includes('--backup');
+  const hasMerge = flags.args.includes('--merge');
 
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  ENV SYNC — Local vs Vercel Environment Check               ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
-
-  // 1. Parse local .env.local
-  const localVars = parseEnvFile(envPath);
-  const localKeys = Object.keys(localVars);
-
-  if (localKeys.length === 0) {
-    console.log('  ✗ No .env.local found or file is empty');
-    console.log(`    Expected at: ${envPath}`);
-    console.log('');
-    return;
-  }
-
-  console.log(`  ✓ Local .env.local — ${localKeys.length} variables`);
-
-  // 2. Backup if requested
-  if (showBackup) {
-    const backupPath = envPath + '.backup.' + new Date().toISOString().slice(0, 10);
-    try {
-      fs.copyFileSync(envPath, backupPath);
-      console.log(`  ✓ Backup saved to ${backupPath}`);
-    } catch (err: any) {
-      console.log(`  ✗ Backup failed: ${err.message}`);
+  // Parse local .env.local (read ALL keys, not just allowlisted)
+  const localVars: Record<string, string> = {};
+  if (existsSync(envPath)) {
+    const content = readFileSync(envPath, 'utf-8');
+    const re = /^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(?:"([^"]*?)"|'([^']*?)'|([^\s#]*))/;
+    for (const line of content.split('\n')) {
+      if (line.trimStart().startsWith('#')) continue;
+      const match = line.match(re);
+      if (match) {
+        const key = match[1];
+        const value = match[2] ?? match[3] ?? match[4] ?? '';
+        if (value) localVars[key] = value;
+      }
     }
   }
 
-  // 3. Check Vercel token
-  const vercelToken = localVars['VERCEL_TOKEN'] || process.env.VERCEL_TOKEN;
-  const projectId = getVercelProjectId(cwd);
+  // Fetch remote env vars
+  const vercelToken = localVars['VERCEL_TOKEN'] || process.env.VERCEL_TOKEN || '';
+  let remoteVars: Record<string, string> = {};
+  let remoteName = 'Vercel';
 
-  let vercelKeys: Record<string, boolean> = {};
-  let hasVercel = false;
+  if (vercelToken) {
+    remoteVars = await fetchVercelEnvVars(vercelToken);
+  }
 
-  if (!vercelToken) {
-    console.log('  ○ No VERCEL_TOKEN found — Vercel comparison skipped');
-    console.log('    Set VERCEL_TOKEN in .env.local or environment to enable');
-  } else if (!projectId) {
-    console.log('  ○ No Vercel project ID found — check .vercel/project.json or VERCEL_PROJECT_ID');
+  if (Object.keys(remoteVars).length === 0 && !vercelToken) {
+    console.log('');
+    console.log(colorize('  No VERCEL_TOKEN found — cannot compare with remote.', 'yellow'));
+    console.log(colorize('  Showing local-only analysis.', 'dim'));
+    console.log('');
+  }
+
+  // Discover known services to detect dead keys
+  const knownServiceKeys = new Set(discoverServices().map(s => s.envVar));
+
+  // Build comparison
+  const allKeys = new Set([...Object.keys(localVars), ...Object.keys(remoteVars)]);
+  const envVars: EnvVar[] = [];
+
+  for (const key of allKeys) {
+    const local = localVars[key] || '';
+    const remote = remoteVars[key] || '';
+
+    let status: EnvVar['status'] = 'healthy';
+    if (local && remote) {
+      if (remote !== '(encrypted)' && local !== remote) {
+        status = 'drift';
+      }
+    } else if (!local && remote) {
+      status = 'missing-local';
+    } else if (local && !remote && Object.keys(remoteVars).length > 0) {
+      status = 'missing-remote';
+    }
+
+    // Dead key detection — key exists but service not in codebase
+    if (local && key.endsWith('_KEY') || key.endsWith('_TOKEN') || key.endsWith('_SECRET')) {
+      // Only flag as dead if we have remote data and key is missing from both sides
+      // For now, skip dead detection to avoid false positives
+    }
+
+    envVars.push({ key, localValue: local ? 'set' : '', vercelValue: remote ? 'set' : '', status });
+  }
+
+  // Sort: issues first, then alphabetical
+  const statusOrder: Record<string, number> = { 'missing-local': 0, drift: 1, 'missing-remote': 2, dead: 3, healthy: 4 };
+  envVars.sort((a, b) => (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99) || a.key.localeCompare(b.key));
+
+  const summary = {
+    total: envVars.length,
+    healthy: envVars.filter(e => e.status === 'healthy').length,
+    missingLocal: envVars.filter(e => e.status === 'missing-local').length,
+    missingRemote: envVars.filter(e => e.status === 'missing-remote').length,
+    drift: envVars.filter(e => e.status === 'drift').length,
+    dead: envVars.filter(e => e.status === 'dead').length,
+  };
+
+  if (flags.json) {
+    console.log(JSON.stringify({ envVars, summary }, null, 2));
+    return;
+  }
+
+  // Print results
+  const statusLabel = (s: EnvVar['status']) => {
+    switch (s) {
+      case 'healthy': return colorize('healthy', 'green');
+      case 'missing-local': return colorize('MISSING LOCAL', 'red');
+      case 'missing-remote': return colorize('missing remote', 'yellow');
+      case 'drift': return colorize('DRIFT', 'yellow');
+      case 'dead': return colorize('dead', 'dim');
+    }
+  };
+
+  const rows = envVars.map(e => [
+    e.key,
+    e.localValue ? colorize('set', 'green') : colorize('—', 'dim'),
+    e.vercelValue ? colorize('set', 'green') : colorize('—', 'dim'),
+    statusLabel(e.status),
+  ]);
+
+  // Only show issues + first 10 healthy
+  const issueRows = rows.filter((_, i) => envVars[i].status !== 'healthy');
+  const healthyRows = rows.filter((_, i) => envVars[i].status === 'healthy').slice(0, 10);
+  const displayRows = [...issueRows, ...healthyRows];
+
+  if (displayRows.length > 0) {
+    table(['Key', 'Local', remoteName, 'Status'], displayRows);
+  }
+
+  if (summary.healthy > 10) {
+    console.log(colorize(`  ... and ${summary.healthy - 10} more healthy vars`, 'dim'));
+  }
+
+  console.log('');
+  const issues = summary.missingLocal + summary.missingRemote + summary.drift;
+  if (issues === 0) {
+    console.log(colorize(`  ${statusIcon(true)}  All ${summary.total} env vars are in sync.`, 'green'));
   } else {
-    console.log(`  ✓ Vercel project: ${projectId}`);
-    console.log('  Fetching Vercel environment...');
-    vercelKeys = await fetchVercelEnv(vercelToken, projectId);
-    hasVercel = Object.keys(vercelKeys).length > 0;
-    if (hasVercel) {
-      console.log(`  ✓ Vercel — ${Object.keys(vercelKeys).length} variables`);
-    }
+    console.log(`  ${colorize(`${issues} issues found:`, 'yellow')} ${summary.missingLocal} missing local, ${summary.missingRemote} missing remote, ${summary.drift} drift`);
   }
-
   console.log('');
 
-  // 4. Build comparison table
-  const allKeys = new Set<string>([...localKeys, ...Object.keys(vercelKeys)]);
-  const entries: EnvEntry[] = [];
-
-  for (const key of Array.from(allKeys).sort()) {
-    const inLocal = key in localVars;
-    const inVercel = key in vercelKeys;
-    let status: EnvEntry['status'] = 'healthy';
-
-    if (inLocal && !inVercel && hasVercel) status = 'missing-vercel';
-    else if (!inLocal && inVercel) status = 'missing-local';
-    else if (inLocal && inVercel) status = 'healthy';
-    else status = 'healthy'; // local only, no vercel comparison
-
-    entries.push({ key, local: inLocal, vercel: inVercel, status });
-  }
-
-  // 5. JSON output
-  if (showJson) {
-    const jsonPath = path.join(cwd, 'env-sync-report.json');
-    const report = {
-      timestamp: new Date().toISOString(),
-      localCount: localKeys.length,
-      vercelCount: Object.keys(vercelKeys).length,
-      hasVercel,
-      entries: entries.map(e => ({ key: e.key, local: e.local, vercel: e.vercel, status: e.status })),
-    };
-    fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-    console.log(`  ✓ JSON report saved to ${jsonPath}`);
-    console.log('');
-    return;
-  }
-
-  // 6. Display table
-  const keyWidth = Math.min(40, Math.max(20, ...entries.map(e => e.key.length + 2)));
-
-  console.log('┌' + '─'.repeat(keyWidth) + '┬─────────┬─────────┬─────────────────┐');
-  console.log('│' + ' Key'.padEnd(keyWidth) + '│ Local   │ Vercel  │ Status          │');
-  console.log('├' + '─'.repeat(keyWidth) + '┼─────────┼─────────┼─────────────────┤');
-
-  let healthy = 0;
-  let missingVercel = 0;
-  let missingLocal = 0;
-
-  for (const entry of entries) {
-    const localIcon = entry.local ? '  ✓    ' : '  ✗    ';
-    const vercelIcon = hasVercel ? (entry.vercel ? '  ✓    ' : '  ✗    ') : '  ─    ';
-    let statusText: string;
-    switch (entry.status) {
-      case 'healthy':        statusText = ' ✓ healthy       '; healthy++; break;
-      case 'missing-vercel': statusText = ' ✗ missing-vercel'; missingVercel++; break;
-      case 'missing-local':  statusText = ' ✗ missing-local '; missingLocal++; break;
-      default:               statusText = ' ○ unknown       '; break;
+  // Backup + write if --merge and not --dry-run
+  if (hasMerge && !flags.dryRun && summary.missingLocal > 0) {
+    if (hasBackup) {
+      copyFileSync(envPath, envPath + '.backup');
+      console.log(colorize(`  Backup saved to .env.local.backup`, 'dim'));
     }
-
-    const displayKey = entry.key.length > keyWidth - 2
-      ? ' ' + entry.key.slice(0, keyWidth - 4) + '… '
-      : (' ' + entry.key).padEnd(keyWidth);
-
-    if (showDiff && entry.status === 'healthy') continue;
-
-    console.log('│' + displayKey + '│' + localIcon + '│' + vercelIcon + '│' + statusText + '│');
+    const missingKeys = envVars.filter(e => e.status === 'missing-local');
+    const content = readFileSync(envPath, 'utf-8');
+    const additions = missingKeys.map(e => `${e.key}=${remoteVars[e.key] || ''}`).join('\n');
+    writeFileSync(envPath, content + '\n# Synced from Vercel\n' + additions + '\n');
+    console.log(colorize(`  Added ${missingKeys.length} missing vars to .env.local`, 'green'));
   }
-
-  console.log('└' + '─'.repeat(keyWidth) + '┴─────────┴─────────┴─────────────────┘');
-  console.log('');
-
-  // 7. Summary
-  console.log(`  Summary: ${healthy} healthy, ${missingVercel} missing in Vercel, ${missingLocal} missing locally`);
-
-  if (showMerge && (missingVercel > 0 || missingLocal > 0)) {
-    console.log('');
-    console.log('  Merge suggestions:');
-    for (const entry of entries) {
-      if (entry.status === 'missing-vercel') {
-        console.log(`    → Add ${entry.key} to Vercel: vercel env add ${entry.key}`);
-      }
-      if (entry.status === 'missing-local') {
-        console.log(`    → Add ${entry.key} to .env.local from Vercel`);
-      }
-    }
-  }
-
-  console.log('');
 }

@@ -1,319 +1,150 @@
 /**
- * Costs command — Cost attribution by model, commit, or feature
+ * costs command — Cost attribution by feature, model, and commit.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { execSync } from 'node:child_process';
-import { scanClaudeSessions, type SessionStats, type TurnRecord } from '../scanners/claude-sessions.js';
-import { discoverFromProject } from '../scanners/env-discovery.js';
+import type { GlobalFlags } from '../cli';
+import { scanProjectSessions, parseSession, analyzeSession, costForUsage, type SessionStats } from '../utils/session-scanner';
+import { discoverFromProject } from '../../fetchers/env-discovery';
+import { runAllFetchers } from '../../fetchers/index';
+import { colorize, box, table, formatCost, formatTokens, sectionHeader } from '../utils/format';
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
-  return n.toLocaleString();
-}
-
-function fmtCost(n: number): string {
-  if (n >= 1) return '$' + n.toFixed(2);
-  if (n >= 0.01) return '$' + n.toFixed(3);
-  return '$' + n.toFixed(4);
-}
-
-interface ModelGroup {
-  model: string;
-  turns: number;
+interface CostEntry {
+  name: string;
   cost: number;
-  tokens: number;
+  calls: number;
   unitCost: number;
+  trend?: string;
 }
 
-function costByModel(sessions: SessionStats[]): ModelGroup[] {
-  const groups: Record<string, { turns: number; cost: number; tokens: number }> = {};
-
-  for (const session of sessions) {
-    for (const turn of session.turns) {
-      const model = turn.model || 'unknown';
-      if (!groups[model]) groups[model] = { turns: 0, cost: 0, tokens: 0 };
-      groups[model].turns++;
-      groups[model].cost += turn.costUsd;
-      groups[model].tokens += turn.totalTokens;
-    }
-  }
-
-  return Object.entries(groups)
-    .map(([model, data]) => ({
-      model,
-      turns: data.turns,
-      cost: data.cost,
-      tokens: data.tokens,
-      unitCost: data.turns > 0 ? data.cost / data.turns : 0,
-    }))
-    .sort((a, b) => b.cost - a.cost);
-}
-
-interface CommitGroup {
-  hash: string;
-  message: string;
-  date: string;
-  cost: number;
-  turns: number;
-}
-
-function costByCommit(sessions: SessionStats[], days: number, cwd: string): CommitGroup[] {
-  // Get git commits
-  let commits: Array<{ hash: string; message: string; date: string; timestamp: number }> = [];
+function getCommits(days: number): Array<{ hash: string; date: string; subject: string; author: string }> {
   try {
-    const log = execSync(
-      `git log --format="%H|%s|%aI" --since="${days} days ago" 2>/dev/null`,
-      { encoding: 'utf-8', cwd }
-    ).trim();
-    if (log) {
-      commits = log.split('\n').filter(Boolean).map(line => {
-        const [hash, message, date] = line.split('|');
-        return { hash, message: message || '', date: date || '', timestamp: new Date(date).getTime() };
-      });
-    }
+    const log = execSync(`git log --format="%H|%aI|%s|%an" --since="${days} days ago"`, { encoding: 'utf-8' });
+    return log.trim().split('\n').filter(Boolean).map(line => {
+      const [hash, date, subject, author] = line.split('|');
+      return { hash: hash.slice(0, 8), date, subject, author };
+    });
   } catch {
     return [];
   }
-
-  if (commits.length === 0) return [];
-
-  // Collect all turns with timestamps
-  const allTurns: TurnRecord[] = sessions.flatMap(s => s.turns).filter(t => t.timestamp);
-  allTurns.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-  // Sort commits by time
-  commits.sort((a, b) => a.timestamp - b.timestamp);
-
-  const results: CommitGroup[] = [];
-
-  for (let i = 0; i < commits.length; i++) {
-    const commit = commits[i];
-    const commitTime = commit.timestamp;
-    const prevTime = i > 0 ? commits[i - 1].timestamp : commitTime - 24 * 60 * 60 * 1000;
-
-    // Find turns between previous commit and this commit
-    const matchingTurns = allTurns.filter(t => {
-      const turnTime = new Date(t.timestamp).getTime();
-      return turnTime > prevTime && turnTime <= commitTime;
-    });
-
-    const cost = matchingTurns.reduce((s, t) => s + t.costUsd, 0);
-    results.push({
-      hash: commit.hash.slice(0, 8),
-      message: commit.message.slice(0, 50),
-      date: commit.date.slice(0, 10),
-      cost,
-      turns: matchingTurns.length,
-    });
-  }
-
-  return results.sort((a, b) => b.cost - a.cost);
 }
 
-interface FeatureGroup {
-  name: string;
-  category: string;
-  configured: boolean;
-}
+export async function costsCommand(flags: GlobalFlags): Promise<void> {
+  const { days, json } = flags;
+  const groupBy = flags.args.includes('--by') ? flags.args[flags.args.indexOf('--by') + 1] : 'model';
 
-function costByFeature(cwd: string): FeatureGroup[] {
-  const discovery = discoverFromProject(cwd);
-  return discovery.configured.map(svc => ({
-    name: svc.name,
-    category: svc.category,
-    configured: true,
-  }));
-}
+  // Get session data
+  const files = scanProjectSessions(days);
+  const allStats = files.map(f => analyzeSession(parseSession(f), days)).filter(Boolean) as SessionStats[];
+  const totalSessionCost = allStats.reduce((a, s) => a + s.estimatedCostUsd, 0);
 
-export async function costs(args: string[]): Promise<void> {
-  const showJson = args.includes('--json');
-  const daysIdx = args.indexOf('--days');
-  const days = daysIdx >= 0 ? parseInt(args[daysIdx + 1]) || 7 : 7;
+  // Get provider costs
+  const { envVars } = discoverFromProject(process.cwd());
+  let providerResults: any[] = [];
+  try {
+    providerResults = await runAllFetchers(envVars, days);
+  } catch { /* */ }
+  const providerCosts = providerResults.filter(r => r.status === 'ok');
+  const totalProviderCost = providerCosts.reduce((a, r) => a + r.cost.amount, 0);
 
-  // Determine grouping mode
-  const byIdx = args.indexOf('--by');
-  const byMode = byIdx >= 0 ? (args[byIdx + 1] || 'model') : 'model';
-
-  const cwd = process.cwd();
-
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  COST ATTRIBUTION                                            ║');
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('');
-
-  const sessions = scanClaudeSessions(days);
-
-  if (byMode === 'model') {
-    if (sessions.length === 0) {
-      console.log('  No Claude Code sessions found. Run some sessions first.');
-      console.log('');
-      return;
-    }
-
-    const groups = costByModel(sessions);
-    const totalCost = groups.reduce((s, g) => s + g.cost, 0);
-    const totalTurns = groups.reduce((s, g) => s + g.turns, 0);
-
-    console.log(`  Grouping by: model  (${days}-day window, ${sessions.length} sessions)`);
-    console.log('');
-
-    // Table header
-    const modelWidth = Math.min(40, Math.max(20, ...groups.map(g => g.model.length + 2)));
-    console.log('┌' + '─'.repeat(modelWidth) + '┬──────────┬──────────┬────────────┬───────────┐');
-    console.log('│' + ' Model'.padEnd(modelWidth) + '│ Turns    │ Cost     │ Tokens     │ $/turn    │');
-    console.log('├' + '─'.repeat(modelWidth) + '┼──────────┼──────────┼────────────┼───────────┤');
-
-    for (const group of groups) {
-      const modelName = group.model.length > modelWidth - 2
-        ? ' ' + group.model.slice(0, modelWidth - 4) + '… '
-        : (' ' + group.model).padEnd(modelWidth);
-      const pctOfCost = totalCost > 0 ? Math.round((group.cost / totalCost) * 100) : 0;
-      console.log(
-        '│' + modelName +
-        '│ ' + String(group.turns).padStart(7) + ' ' +
-        '│ ' + fmtCost(group.cost).padStart(7) + ' ' +
-        '│ ' + fmtTokens(group.tokens).padStart(9) + ' ' +
-        '│ ' + fmtCost(group.unitCost).padStart(8) + ' │'
-      );
-    }
-
-    console.log('├' + '─'.repeat(modelWidth) + '┼──────────┼──────────┼────────────┼───────────┤');
-    console.log(
-      '│' + ' TOTAL'.padEnd(modelWidth) +
-      '│ ' + String(totalTurns).padStart(7) + ' ' +
-      '│ ' + fmtCost(totalCost).padStart(7) + ' ' +
-      '│ ' + fmtTokens(groups.reduce((s, g) => s + g.tokens, 0)).padStart(9) + ' ' +
-      '│ ' + fmtCost(totalTurns > 0 ? totalCost / totalTurns : 0).padStart(8) + ' │'
-    );
-    console.log('└' + '─'.repeat(modelWidth) + '┴──────────┴──────────┴────────────┴───────────┘');
-
-    if (showJson) {
-      const jsonPath = path.join(cwd, 'costs-report.json');
-      const report = {
-        timestamp: new Date().toISOString(),
-        mode: 'model',
-        days,
-        sessions: sessions.length,
-        totalCost,
-        totalTurns,
-        groups: groups.map(g => ({ model: g.model, turns: g.turns, cost: g.cost, tokens: g.tokens, unitCost: g.unitCost })),
-      };
-      fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-      console.log('');
-      console.log(`  ✓ JSON report saved to ${jsonPath}`);
-    }
-
-  } else if (byMode === 'commit') {
-    if (sessions.length === 0) {
-      console.log('  No Claude Code sessions found. Run some sessions first.');
-      console.log('');
-      return;
-    }
-
-    const commitGroups = costByCommit(sessions, days, cwd);
-
-    if (commitGroups.length === 0) {
-      console.log('  No git commits found in the lookback window.');
-      console.log('');
-      return;
-    }
-
-    console.log(`  Grouping by: commit  (${days}-day window)`);
-    console.log('');
-
-    console.log('┌──────────┬──────────┬────────┬────────────────────────────────────────────┐');
-    console.log('│ Hash     │ Cost     │ Turns  │ Message                                    │');
-    console.log('├──────────┼──────────┼────────┼────────────────────────────────────────────┤');
-
-    const shown = commitGroups.slice(0, 20);
-    for (const commit of shown) {
-      const msg = commit.message.length > 42 ? commit.message.slice(0, 39) + '…' : commit.message;
-      console.log(
-        '│ ' + commit.hash.padEnd(9) +
-        '│ ' + fmtCost(commit.cost).padStart(7) + ' ' +
-        '│ ' + String(commit.turns).padStart(5) + ' ' +
-        '│ ' + msg.padEnd(43) + '│'
-      );
-    }
-
-    if (commitGroups.length > 20) {
-      console.log(`│ … and ${commitGroups.length - 20} more commits`.padEnd(99) + '│');
-    }
-
-    console.log('└──────────┴──────────┴────────┴────────────────────────────────────────────┘');
-
-    const totalCommitCost = commitGroups.reduce((s, c) => s + c.cost, 0);
-    const avgCostPerCommit = commitGroups.length > 0 ? totalCommitCost / commitGroups.length : 0;
-    console.log('');
-    console.log(`  Total: ${fmtCost(totalCommitCost)} across ${commitGroups.length} commits — avg ${fmtCost(avgCostPerCommit)}/commit`);
-
-    if (showJson) {
-      const jsonPath = path.join(cwd, 'costs-report.json');
-      const report = {
-        timestamp: new Date().toISOString(),
-        mode: 'commit',
-        days,
-        totalCost: totalCommitCost,
-        avgCostPerCommit,
-        commits: commitGroups,
-      };
-      fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-      console.log(`  ✓ JSON report saved to ${jsonPath}`);
-    }
-
-  } else if (byMode === 'feature') {
-    const features = costByFeature(cwd);
-
-    if (features.length === 0) {
-      console.log('  No configured services found in .env.local.');
-      console.log('  Run from your project directory with a .env.local file.');
-      console.log('');
-      return;
-    }
-
-    console.log(`  Grouping by: feature/service  (from .env.local)`);
-    console.log('');
-    console.log('  Configured provider services:');
-    console.log('');
-
-    const categories: Record<string, FeatureGroup[]> = {};
-    for (const feat of features) {
-      if (!categories[feat.category]) categories[feat.category] = [];
-      categories[feat.category].push(feat);
-    }
-
-    for (const [category, feats] of Object.entries(categories).sort()) {
-      console.log(`  ${category}:`);
-      for (const feat of feats) {
-        console.log(`    ✓ ${feat.name}`);
+  if (groupBy === 'model') {
+    // Group Claude Code costs by model
+    const modelCosts: Record<string, { cost: number; turns: number; tokens: number }> = {};
+    for (const stats of allStats) {
+      for (const turn of stats.turns) {
+        const model = turn.model || 'unknown';
+        if (!modelCosts[model]) modelCosts[model] = { cost: 0, turns: 0, tokens: 0 };
+        modelCosts[model].cost += turn.costUsd;
+        modelCosts[model].turns += 1;
+        modelCosts[model].tokens += turn.totalTokens;
       }
     }
 
-    console.log('');
-    console.log('  Note: Per-service cost breakdown requires provider API access.');
-    console.log('  Use --by model for Claude Code costs, or --by commit for cost-per-commit.');
+    const entries = Object.entries(modelCosts)
+      .sort((a, b) => b[1].cost - a[1].cost)
+      .map(([model, data]) => ({
+        name: model.replace('claude-', '').slice(0, 25),
+        cost: data.cost,
+        calls: data.turns,
+        unitCost: data.turns > 0 ? data.cost / data.turns : 0,
+      }));
 
-    if (showJson) {
-      const jsonPath = path.join(cwd, 'costs-report.json');
-      const report = {
-        timestamp: new Date().toISOString(),
-        mode: 'feature',
-        services: features,
-      };
-      fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-      console.log('');
-      console.log(`  ✓ JSON report saved to ${jsonPath}`);
+    if (json) {
+      console.log(JSON.stringify({ groupBy, entries, totalSessionCost, totalProviderCost }, null, 2));
+      return;
     }
 
-  } else {
-    console.log(`  Unknown grouping: --by ${byMode}`);
-    console.log('  Supported: --by model, --by commit, --by feature');
+    sectionHeader('Cost by Model (Claude Code)');
+    const rows = entries.map(e => [
+      e.name,
+      formatCost(e.cost),
+      String(e.calls) + ' turns',
+      formatCost(e.unitCost) + '/turn',
+      ((e.cost / Math.max(0.01, totalSessionCost)) * 100).toFixed(0) + '%',
+    ]);
+    if (rows.length > 0) table(['Model', 'Cost', 'Turns', 'Unit Cost', '%'], rows);
   }
 
+  if (groupBy === 'commit') {
+    const commits = getCommits(days);
+    // Correlate commits with sessions by timestamp
+    const commitCosts: Array<{ hash: string; subject: string; cost: number }> = [];
+
+    for (const commit of commits.slice(0, 20)) {
+      const commitTime = new Date(commit.date).getTime();
+      // Find sessions active around commit time (within 1 hour)
+      let cost = 0;
+      for (const stats of allStats) {
+        const sessionStart = new Date(stats.startedAt).getTime();
+        const sessionEnd = new Date(stats.endedAt).getTime();
+        if (commitTime >= sessionStart - 3600000 && commitTime <= sessionEnd + 3600000) {
+          // Estimate: this session's cost contributed to this commit
+          cost += stats.estimatedCostUsd / Math.max(1, commits.filter(c => {
+            const ct = new Date(c.date).getTime();
+            return ct >= sessionStart - 3600000 && ct <= sessionEnd + 3600000;
+          }).length);
+        }
+      }
+      commitCosts.push({ hash: commit.hash, subject: commit.subject.slice(0, 50), cost });
+    }
+
+    if (json) {
+      console.log(JSON.stringify({ groupBy, commitCosts, totalSessionCost }, null, 2));
+      return;
+    }
+
+    sectionHeader('Cost by Commit');
+    const rows = commitCosts.map(c => [
+      colorize(c.hash, 'dim'),
+      c.subject,
+      c.cost > 0 ? formatCost(c.cost) : colorize('$0.00', 'dim'),
+    ]);
+    if (rows.length > 0) table(['Hash', 'Message', 'Est. Cost'], rows);
+  }
+
+  if (groupBy === 'feature') {
+    // Group provider costs by provider as proxy for feature
+    if (json) {
+      console.log(JSON.stringify({ groupBy, providerCosts: providerCosts.map(p => ({ provider: p.provider, cost: p.cost.amount, usage: p.usage })), totalProviderCost }, null, 2));
+      return;
+    }
+
+    sectionHeader('Cost by Provider');
+    const rows = providerCosts
+      .sort((a, b) => b.cost.amount - a.cost.amount)
+      .map(p => [
+        p.provider,
+        p.category,
+        formatCost(p.cost.amount),
+        `${p.usage.primary.value} ${p.usage.primary.unit}`,
+      ]);
+    if (rows.length > 0) table(['Provider', 'Category', 'Cost', 'Usage'], rows);
+  }
+
+  // Summary
+  console.log('');
+  console.log(`  ${colorize('Total Claude Code:', 'bold')} ${formatCost(totalSessionCost)} (${allStats.length} sessions, ${days}d)`);
+  console.log(`  ${colorize('Total Providers:', 'bold')}   ${formatCost(totalProviderCost)} (${providerCosts.length} services, ${days}d)`);
+  console.log(`  ${colorize('Total Burn Rate:', 'bold')}   ${formatCost(totalSessionCost + totalProviderCost)}`);
   console.log('');
 }

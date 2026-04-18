@@ -1,263 +1,1101 @@
 /**
- * audit command — Claude Code expert audit
+ * audit command — Claude Code expert audit of your .claude setup, skills, env, and configuration.
  *
- * Analyzes: CLAUDE.md, .claude/ structure, skills, .env.local, settings, plans, memory, sessions
- * Provides: score (0-100), findings by severity, expert recommendations, action list
- * Optionally pushes results to the platform Command Center.
+ * Analyzes: .claude/ folder, .env.local, skills, plans, memory, settings, CLAUDE.md
+ * Provides: overview, expert feedback, optimization recommendations, actions needed.
+ * Optionally pushes results to the platform for Command Center display.
+ *
+ * Usage:
+ *   promptreports audit              # Full audit with formatted output
+ *   promptreports audit --json       # JSON output
+ *   promptreports audit --push       # Push results to platform
+ *   promptreports audit --fix        # Auto-fix safe issues (permissions, missing files)
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { homedir } from 'node:os';
+import type { GlobalFlags } from '../cli';
+import { colorize, statusIcon, box, sectionHeader, table, progressBar } from '../utils/format';
 
-// ─── Inline format helpers ─────────────────────────────────────────────────
+// ─── Types ──────────────────────────────────────────────────────────────────
 
-const CLR: Record<string, string> = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', blue: '\x1b[34m', cyan: '\x1b[36m' };
-function clr(text: string, color: string): string { return `${CLR[color] || ''}${text}${CLR.reset}`; }
-function strip(s: string): string { return s.replace(/\x1b\[[0-9;]*m/g, ''); }
-
-function printBox(title: string, content: string): void {
-  const lines = content.split('\n');
-  const w = Math.max(title.length + 4, ...lines.map(l => strip(l).length + 4), 60);
-  console.log(`\u250C${''.padEnd(w, '\u2500')}\u2510`);
-  console.log(`\u2502  ${title.padEnd(w - 2)}\u2502`);
-  console.log(`\u251C${''.padEnd(w, '\u2500')}\u2524`);
-  for (const l of lines) { const vis = strip(l); console.log(`\u2502  ${l}${' '.repeat(Math.max(0, w - 2 - vis.length))}\u2502`); }
-  console.log(`\u2514${''.padEnd(w, '\u2500')}\u2518`);
+interface AuditFinding {
+  category: 'claude-md' | 'skills' | 'env' | 'settings' | 'plans' | 'memory' | 'sessions' | 'structure';
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  title: string;
+  detail: string;
+  action?: string;
+  autoFixable?: boolean;
 }
 
-function printSection(title: string): void { console.log(`\n\u2550\u2550\u2550 ${clr(title, 'bold')} ${''.padEnd(Math.max(0, 55 - title.length), '\u2550')}\n`); }
-
-function pBar(pct: number): string {
-  const w = 30; const f = Math.round((Math.max(0, Math.min(100, pct)) / 100) * w);
-  return `[${'#'.repeat(f)}${'-'.repeat(w - f)}] ${Math.round(pct)}%`;
+interface SkillInfo {
+  name: string;
+  path: string;
+  lines: number;
+  hasReferences: boolean;
+  isUserInvocable: boolean;
+  hasDescription: boolean;
+  hasTriggers: boolean;
 }
 
-function printTable(headers: string[], rows: string[][]): void {
-  const widths = headers.map((h, i) => Math.max(strip(h).length, ...rows.map(r => strip(r[i] || '').length)) + 2);
-  const sep = (l: string, m: string, r: string) => l + widths.map(w => ''.padEnd(w, '\u2500')).join(m) + r;
-  console.log(sep('\u250C', '\u252C', '\u2510'));
-  console.log('\u2502' + headers.map((h, i) => ` ${h.padEnd(widths[i] - 1)}`).join('\u2502') + '\u2502');
-  console.log(sep('\u251C', '\u253C', '\u2524'));
-  for (const r of rows) console.log('\u2502' + headers.map((_, i) => { const cell = r[i] || ''; return ` ${cell}${' '.repeat(Math.max(0, widths[i] - 1 - strip(cell).length))}`; }).join('\u2502') + '\u2502');
-  console.log(sep('\u2514', '\u2534', '\u2518'));
+interface AuditResult {
+  score: number;
+  findings: AuditFinding[];
+  overview: {
+    claudeMdExists: boolean;
+    claudeMdWords: number;
+    skillCount: number;
+    planCount: number;
+    memoryCount: number;
+    envVarCount: number;
+    configuredServices: number;
+    totalServices: number;
+    sessionCount: number;
+    settingsExists: boolean;
+    totalDocsSize: number;
+  };
+  skills: SkillInfo[];
+  recommendations: string[];
+  timestamp: string;
 }
 
-// ─── Types ─────────────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────────────────
 
-interface Finding { category: string; severity: 'critical' | 'high' | 'medium' | 'low' | 'info'; title: string; detail: string; action?: string; }
-interface SkillInfo { name: string; path: string; lines: number; hasReferences: boolean; isUserInvocable: boolean; hasDescription: boolean; hasTriggers: boolean; }
-interface AuditResult { score: number; findings: Finding[]; overview: Record<string, any>; skills: SkillInfo[]; recommendations: string[]; timestamp: string; }
+const ESSENTIAL_DOCS = [
+  'CLAUDE.md',
+  'LESSONS.md',
+  'progress.txt',
+  'DESIGN_SYSTEM.md',
+  'TECH_STACK.md',
+  'BACKEND_STRUCTURE.md',
+  'FRONTEND_GUIDELINES.md',
+];
 
-// ─── Constants ─────────────────────────────────────────────────────────────
+const RECOMMENDED_DOCS = [
+  'IMPLEMENTATION_PLAN.md',
+  'BUILD_ERROR_FIXES.md',
+  'SECURITY_BEST_PRACTICES.md',
+  'APP_FLOW.md',
+  'PRD.md',
+  'AGENTS.md',
+  'SOUL.md',
+  'PRINCIPLES.md',
+];
 
-const ESSENTIAL_DOCS = ['CLAUDE.md', 'LESSONS.md', 'progress.txt', 'DESIGN_SYSTEM.md', 'TECH_STACK.md', 'BACKEND_STRUCTURE.md', 'FRONTEND_GUIDELINES.md'];
-const RECOMMENDED_DOCS = ['IMPLEMENTATION_PLAN.md', 'BUILD_ERROR_FIXES.md', 'SECURITY_BEST_PRACTICES.md', 'APP_FLOW.md', 'PRD.md', 'AGENTS.md', 'SOUL.md', 'PRINCIPLES.md'];
-const CRITICAL_VARS = ['DATABASE_URL', 'NEXTAUTH_SECRET', 'NEXTAUTH_URL'];
-const RECOMMENDED_VARS = ['OPENROUTER_API_KEY', 'STRIPE_SECRET_KEY', 'SENTRY_DSN', 'GITHUB_TOKEN', 'VERCEL_TOKEN', 'PROMPTREPORTS_API_KEY'];
+const CRITICAL_ENV_VARS = [
+  'DATABASE_URL',
+  'NEXTAUTH_SECRET',
+  'NEXTAUTH_URL',
+];
 
-// ─── Auditors ──────────────────────────────────────────────────────────────
+const RECOMMENDED_ENV_VARS = [
+  'OPENROUTER_API_KEY',
+  'STRIPE_SECRET_KEY',
+  'SENTRY_DSN',
+  'GITHUB_TOKEN',
+  'VERCEL_TOKEN',
+  'PROMPTREPORTS_API_KEY',
+];
 
-function auditClaudeMd(cwd: string): Finding[] {
-  const findings: Finding[] = [];
-  const p = path.join(cwd, 'CLAUDE.md');
-  if (!fs.existsSync(p)) { findings.push({ category: 'claude-md', severity: 'critical', title: 'CLAUDE.md missing', detail: 'No root CLAUDE.md found — primary instruction file for Claude Code.', action: 'Create CLAUDE.md with project rules, tech stack, and conventions.' }); return findings; }
-  const content = fs.readFileSync(p, 'utf-8');
+// ─── Auditors ───────────────────────────────────────────────────────────────
+
+function auditClaudeMd(cwd: string): AuditFinding[] {
+  const findings: AuditFinding[] = [];
+  const claudeMdPath = join(cwd, 'CLAUDE.md');
+
+  if (!existsSync(claudeMdPath)) {
+    findings.push({
+      category: 'claude-md', severity: 'critical',
+      title: 'CLAUDE.md missing',
+      detail: 'No root CLAUDE.md file found. This is the primary instruction file for Claude Code.',
+      action: 'Create CLAUDE.md with project rules, tech stack, and conventions.',
+      autoFixable: false,
+    });
+    return findings;
+  }
+
+  const content = readFileSync(claudeMdPath, 'utf-8');
   const words = content.split(/\s+/).filter(Boolean).length;
-  if (words < 200) findings.push({ category: 'claude-md', severity: 'high', title: 'CLAUDE.md is too thin', detail: `Only ${words} words. Effective files are 500-2000 words.`, action: 'Add tech stack, conventions, directory structure, guardrails.' });
-  else if (words > 5000) findings.push({ category: 'claude-md', severity: 'medium', title: 'CLAUDE.md is very large', detail: `${words} words — consuming significant context each turn.`, action: 'Move detailed docs to .claude/ and reference from CLAUDE.md.' });
-  else findings.push({ category: 'claude-md', severity: 'info', title: 'CLAUDE.md size is good', detail: `${words} words.` });
-  if (!/tech.?stack|framework|dependencies/i.test(content)) findings.push({ category: 'claude-md', severity: 'medium', title: 'Missing tech stack section', detail: 'Should list frameworks and versions.', action: 'Add Tech Stack section.' });
-  if (!/convention|naming|pattern|rule/i.test(content)) findings.push({ category: 'claude-md', severity: 'medium', title: 'Missing conventions', detail: 'No naming conventions documented.', action: 'Add naming conventions.' });
-  if (!/forbidden|not.?allowed|never|don.?t/i.test(content)) findings.push({ category: 'claude-md', severity: 'low', title: 'No guardrails', detail: 'Explicit rules prevent AI mistakes.', action: 'Add forbidden patterns.' });
+  const lines = content.split('\n').length;
+
+  if (words < 200) {
+    findings.push({
+      category: 'claude-md', severity: 'high',
+      title: 'CLAUDE.md is too thin',
+      detail: `Only ${words} words (${lines} lines). Effective CLAUDE.md files are 500-2000 words.`,
+      action: 'Add project overview, tech stack, conventions, file structure, and common patterns.',
+    });
+  } else if (words > 5000) {
+    findings.push({
+      category: 'claude-md', severity: 'medium',
+      title: 'CLAUDE.md is very large',
+      detail: `${words} words (${lines} lines). Large files consume context window on every turn.`,
+      action: 'Move detailed docs to .claude/ subdirectory files and reference them from CLAUDE.md.',
+    });
+  } else {
+    findings.push({
+      category: 'claude-md', severity: 'info',
+      title: 'CLAUDE.md size is good',
+      detail: `${words} words, ${lines} lines — well within the effective range.`,
+    });
+  }
+
+  // Check for key sections
+  const hasStack = /tech.?stack|framework|dependencies/i.test(content);
+  const hasConventions = /convention|naming|pattern|rule/i.test(content);
+  const hasStructure = /directory|structure|folder|layout/i.test(content);
+  const hasForbidden = /forbidden|not.?allowed|never|don.?t/i.test(content);
+
+  if (!hasStack) findings.push({ category: 'claude-md', severity: 'medium', title: 'Missing tech stack section', detail: 'CLAUDE.md should list frameworks, versions, and key dependencies.', action: 'Add a Tech Stack section.' });
+  if (!hasConventions) findings.push({ category: 'claude-md', severity: 'medium', title: 'Missing conventions', detail: 'No naming conventions or coding patterns documented.', action: 'Add conventions for files, components, APIs, and types.' });
+  if (!hasStructure) findings.push({ category: 'claude-md', severity: 'low', title: 'No directory structure', detail: 'Helps Claude navigate large codebases faster.', action: 'Add a directory tree showing key folders.' });
+  if (!hasForbidden) findings.push({ category: 'claude-md', severity: 'low', title: 'No guardrails defined', detail: 'Explicit "don\'t do X" rules prevent common AI mistakes.', action: 'Add forbidden patterns (e.g., no any types, no hardcoded secrets).' });
+
   return findings;
 }
 
-function auditStructure(cwd: string): { findings: Finding[]; docSizes: number } {
-  const findings: Finding[] = []; const dir = path.join(cwd, '.claude'); let sz = 0;
-  if (!fs.existsSync(dir)) { findings.push({ category: 'structure', severity: 'high', title: '.claude/ directory missing', detail: 'Canonical docs, skills, and plans live here.', action: 'Create .claude/ with LESSONS.md and progress.txt.' }); return { findings, docSizes: 0 }; }
-  for (const d of ESSENTIAL_DOCS) { const p = d === 'CLAUDE.md' ? path.join(cwd, d) : path.join(dir, d); if (!fs.existsSync(p)) findings.push({ category: 'structure', severity: d === 'CLAUDE.md' ? 'critical' : 'medium', title: `Missing ${d}`, detail: 'Recommended for effective Claude Code.', action: `Create .claude/${d}.` }); else { try { sz += fs.statSync(p).size; } catch {} } }
-  let rec = 0; for (const d of RECOMMENDED_DOCS) { if (fs.existsSync(path.join(dir, d))) { rec++; try { sz += fs.statSync(path.join(dir, d)).size; } catch {} } }
-  if (rec < 3) findings.push({ category: 'structure', severity: 'low', title: `Few supplementary docs (${rec}/${RECOMMENDED_DOCS.length})`, detail: 'More context docs help Claude.', action: 'Add PRD.md, APP_FLOW.md, or BUILD_ERROR_FIXES.md.' });
-  return { findings, docSizes: sz };
+function auditStructure(cwd: string): { findings: AuditFinding[]; docSizes: number } {
+  const findings: AuditFinding[] = [];
+  const claudeDir = join(cwd, '.claude');
+  let totalSize = 0;
+
+  if (!existsSync(claudeDir)) {
+    findings.push({
+      category: 'structure', severity: 'high',
+      title: '.claude/ directory missing',
+      detail: 'No .claude/ directory found. This is where canonical docs, skills, and plans live.',
+      action: 'Create .claude/ with at minimum LESSONS.md and progress.txt.',
+    });
+    return { findings, docSizes: 0 };
+  }
+
+  // Check essential docs
+  for (const doc of ESSENTIAL_DOCS) {
+    const p = doc === 'CLAUDE.md' ? join(cwd, doc) : join(claudeDir, doc);
+    if (!existsSync(p)) {
+      findings.push({
+        category: 'structure', severity: doc === 'CLAUDE.md' ? 'critical' : 'medium',
+        title: `Missing ${doc}`,
+        detail: `${doc} is recommended for effective Claude Code sessions.`,
+        action: `Create .claude/${doc} with relevant content.`,
+      });
+    } else {
+      try { totalSize += statSync(p).size; } catch { /* */ }
+    }
+  }
+
+  // Check recommended docs
+  let recommendedFound = 0;
+  for (const doc of RECOMMENDED_DOCS) {
+    const p = join(claudeDir, doc);
+    if (existsSync(p)) {
+      recommendedFound++;
+      try { totalSize += statSync(p).size; } catch { /* */ }
+    }
+  }
+
+  if (recommendedFound < 3) {
+    findings.push({
+      category: 'structure', severity: 'low',
+      title: 'Few supplementary docs',
+      detail: `Only ${recommendedFound}/${RECOMMENDED_DOCS.length} recommended docs found.`,
+      action: 'Consider adding PRD.md, APP_FLOW.md, or BUILD_ERROR_FIXES.md for richer context.',
+    });
+  }
+
+  // Check for tasks directory
+  if (!existsSync(join(claudeDir, 'tasks'))) {
+    findings.push({
+      category: 'structure', severity: 'low',
+      title: 'No tasks/ directory',
+      detail: 'tasks/todo.md is useful for session planning.',
+      action: 'Create .claude/tasks/ for session work plans.',
+    });
+  }
+
+  return { findings, docSizes: totalSize };
 }
 
-function auditSkills(cwd: string): { findings: Finding[]; skills: SkillInfo[] } {
-  const findings: Finding[] = []; const skills: SkillInfo[] = []; const dir = path.join(cwd, '.claude', 'skills');
-  if (!fs.existsSync(dir)) { findings.push({ category: 'skills', severity: 'low', title: 'No skills directory', detail: 'Skills enable complex workflows.', action: 'Create .claude/skills/ with SKILL.md files.' }); return { findings, skills }; }
-  const files: string[] = [];
-  function walk(d: string) { try { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else if (e.name === 'SKILL.md') files.push(f); } } catch {} }
-  walk(dir);
-  if (files.length === 0) { findings.push({ category: 'skills', severity: 'low', title: 'Skills directory is empty', detail: 'No SKILL.md files.', action: 'Add skills for common workflows.' }); return { findings, skills }; }
-  let noDesc = 0, tooShort = 0, tooLong = 0;
-  for (const fp of files) {
-    const content = fs.readFileSync(fp, 'utf-8'); const lines = content.split('\n').length;
-    const fm = (content.match(/^---\n([\s\S]*?)\n---/)?.[1]) || '';
-    const name = fm.match(/name:\s*(.+)/)?.[1]?.trim() || path.relative(cwd, fp).split(/[/\\]/).slice(-2, -1)[0] || 'unknown';
-    const hasDesc = /description:/i.test(fm), isInv = /user-invocable:\s*true/i.test(fm), hasTrig = /trigger|use when/i.test(content), hasRefs = fs.existsSync(path.join(fp, '..', 'references'));
-    if (!hasDesc) noDesc++; if (lines < 20) tooShort++; if (lines > 2000) tooLong++;
-    skills.push({ name, path: path.relative(cwd, fp), lines, hasReferences: hasRefs, isUserInvocable: isInv, hasDescription: hasDesc, hasTriggers: hasTrig });
+function auditSkills(cwd: string): { findings: AuditFinding[]; skills: SkillInfo[] } {
+  const findings: AuditFinding[] = [];
+  const skills: SkillInfo[] = [];
+  const skillsDir = join(cwd, '.claude', 'skills');
+
+  if (!existsSync(skillsDir)) {
+    findings.push({
+      category: 'skills', severity: 'low',
+      title: 'No skills directory',
+      detail: 'Skills let Claude Code execute complex workflows via /slash commands.',
+      action: 'Create .claude/skills/ and add SKILL.md files for repeated workflows.',
+    });
+    return { findings, skills };
   }
-  if (noDesc > 0) findings.push({ category: 'skills', severity: 'medium', title: `${noDesc} skill(s) missing description`, detail: 'Cannot be matched automatically.', action: 'Add description to frontmatter.' });
-  if (tooShort > 0) findings.push({ category: 'skills', severity: 'low', title: `${tooShort} skill(s) very short (<20 lines)`, detail: 'May not provide enough guidance.' });
-  if (tooLong > 0) findings.push({ category: 'skills', severity: 'medium', title: `${tooLong} skill(s) > 2000 lines`, detail: 'Consuming significant context.', action: 'Split large skills.' });
-  findings.push({ category: 'skills', severity: 'info', title: `${files.length} skills installed`, detail: `${skills.filter(s => s.isUserInvocable).length} user-invocable, ${skills.filter(s => s.hasReferences).length} with refs.` });
+
+  // Recursively find all SKILL.md files
+  const skillFiles: string[] = [];
+  function walk(dir: string) {
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name === 'SKILL.md') skillFiles.push(full);
+      }
+    } catch { /* */ }
+  }
+  walk(skillsDir);
+
+  if (skillFiles.length === 0) {
+    findings.push({
+      category: 'skills', severity: 'low',
+      title: 'Skills directory is empty',
+      detail: 'No SKILL.md files found in .claude/skills/.',
+      action: 'Add skills for your most common workflows (e.g., deploy, test, review).',
+    });
+    return { findings, skills };
+  }
+
+  let noDescription = 0;
+  let noTriggers = 0;
+  let tooShort = 0;
+  let tooLong = 0;
+
+  for (const fp of skillFiles) {
+    const content = readFileSync(fp, 'utf-8');
+    const lines = content.split('\n').length;
+    const relPath = relative(cwd, fp);
+
+    // Parse frontmatter
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    const fm = fmMatch?.[1] || '';
+    const name = fm.match(/name:\s*(.+)/)?.[1]?.trim() || relPath.split(/[/\\]/).slice(-2, -1)[0] || 'unknown';
+    const hasDescription = /description:/i.test(fm);
+    const isUserInvocable = /user-invocable:\s*true/i.test(fm);
+    const hasTriggers = /trigger/i.test(content) || /use when/i.test(content);
+    const hasRefs = existsSync(join(fp, '..', 'references'));
+
+    if (!hasDescription) noDescription++;
+    if (!hasTriggers) noTriggers++;
+    if (lines < 20) tooShort++;
+    if (lines > 2000) tooLong++;
+
+    skills.push({
+      name,
+      path: relPath,
+      lines,
+      hasReferences: hasRefs,
+      isUserInvocable: isUserInvocable,
+      hasDescription,
+      hasTriggers,
+    });
+  }
+
+  // Aggregate findings
+  if (noDescription > 0) {
+    findings.push({
+      category: 'skills', severity: 'medium',
+      title: `${noDescription} skill(s) missing description`,
+      detail: 'Skills without descriptions cannot be matched to user requests automatically.',
+      action: 'Add a description field to the YAML frontmatter of each skill.',
+    });
+  }
+  if (tooShort > 0) {
+    findings.push({
+      category: 'skills', severity: 'low',
+      title: `${tooShort} skill(s) are very short (<20 lines)`,
+      detail: 'Short skills may not provide enough guidance for complex workflows.',
+      action: 'Expand thin skills with step-by-step instructions, examples, and verification steps.',
+    });
+  }
+  if (tooLong > 0) {
+    findings.push({
+      category: 'skills', severity: 'medium',
+      title: `${tooLong} skill(s) exceed 2000 lines`,
+      detail: 'Very long skills consume significant context window when loaded.',
+      action: 'Split large skills into focused sub-skills or move reference data to separate files.',
+    });
+  }
+
+  findings.push({
+    category: 'skills', severity: 'info',
+    title: `${skillFiles.length} skills installed`,
+    detail: `${skills.filter(s => s.isUserInvocable).length} user-invocable, ${skills.filter(s => s.hasReferences).length} with reference data.`,
+  });
+
   return { findings, skills };
 }
 
-function auditEnv(cwd: string): { findings: Finding[]; varCount: number; configured: number; total: number } {
-  const findings: Finding[] = []; const ep = path.join(cwd, '.env.local');
-  if (!fs.existsSync(ep)) { findings.push({ category: 'env', severity: 'critical', title: '.env.local missing', detail: 'Cannot connect to services.', action: 'Copy .env.example to .env.local.' }); return { findings, varCount: 0, configured: 0, total: 9 }; }
-  const vars = new Map<string, string>();
-  for (const line of fs.readFileSync(ep, 'utf-8').split('\n')) { const t = line.trim(); if (!t || t.startsWith('#')) continue; const eq = t.indexOf('='); if (eq > 0) vars.set(t.slice(0, eq).trim(), t.slice(eq + 1).trim().replace(/^["']|["']$/g, '')); }
-  for (const v of CRITICAL_VARS) { if (!vars.get(v)) findings.push({ category: 'env', severity: 'critical', title: `Missing ${v}`, detail: 'Required for the app.', action: `Set ${v} in .env.local.` }); }
-  const recMissing = RECOMMENDED_VARS.filter(v => !vars.get(v));
-  if (recMissing.length > 0) findings.push({ category: 'env', severity: 'low', title: `${recMissing.length} recommended vars not set`, detail: `Missing: ${recMissing.join(', ')}` });
-  let ph = 0; for (const [, v] of vars) { if (['changeme', 'your-', 'xxx', 'todo', 'placeholder'].some(p => v.toLowerCase().includes(p))) ph++; }
-  if (ph > 0) findings.push({ category: 'env', severity: 'high', title: `${ph} placeholder value(s)`, detail: 'Replace with real credentials.', action: 'Update all placeholders.' });
-  const conf = CRITICAL_VARS.filter(v => vars.get(v)).length + RECOMMENDED_VARS.filter(v => vars.get(v)).length;
-  return { findings, varCount: vars.size, configured: conf, total: CRITICAL_VARS.length + RECOMMENDED_VARS.length };
+function auditEnv(cwd: string): { findings: AuditFinding[]; varCount: number; configured: number; total: number } {
+  const findings: AuditFinding[] = [];
+  const envPath = join(cwd, '.env.local');
+
+  if (!existsSync(envPath)) {
+    findings.push({
+      category: 'env', severity: 'critical',
+      title: '.env.local missing',
+      detail: 'No environment file found. The app cannot connect to services.',
+      action: 'Copy .env.example to .env.local and fill in values.',
+      autoFixable: false,
+    });
+    return { findings, varCount: 0, configured: 0, total: CRITICAL_ENV_VARS.length + RECOMMENDED_ENV_VARS.length };
+  }
+
+  const content = readFileSync(envPath, 'utf-8');
+  const envVars = new Map<string, string>();
+
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq > 0) {
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      envVars.set(key, val);
+    }
+  }
+
+  // Check critical vars
+  for (const v of CRITICAL_ENV_VARS) {
+    if (!envVars.has(v) || !envVars.get(v)) {
+      findings.push({
+        category: 'env', severity: 'critical',
+        title: `Missing ${v}`,
+        detail: `${v} is required for the app to function.`,
+        action: `Set ${v} in .env.local.`,
+      });
+    }
+  }
+
+  // Check recommended vars
+  let recommendedMissing = 0;
+  for (const v of RECOMMENDED_ENV_VARS) {
+    if (!envVars.has(v) || !envVars.get(v)) recommendedMissing++;
+  }
+
+  if (recommendedMissing > 0) {
+    findings.push({
+      category: 'env', severity: 'low',
+      title: `${recommendedMissing} recommended env vars not set`,
+      detail: `Missing: ${RECOMMENDED_ENV_VARS.filter(v => !envVars.has(v) || !envVars.get(v)).join(', ')}`,
+      action: 'Configure these for full platform functionality (push, providers, monitoring).',
+    });
+  }
+
+  // Check for placeholder values
+  const placeholders = ['changeme', 'your-', 'xxx', 'todo', 'placeholder', 'CHANGE_ME'];
+  let placeholderCount = 0;
+  for (const [key, val] of envVars) {
+    if (placeholders.some(p => val.toLowerCase().includes(p))) {
+      placeholderCount++;
+    }
+  }
+  if (placeholderCount > 0) {
+    findings.push({
+      category: 'env', severity: 'high',
+      title: `${placeholderCount} env var(s) contain placeholder values`,
+      detail: 'Variables with values like "changeme" or "your-key-here" need real values.',
+      action: 'Replace all placeholder values with real credentials.',
+    });
+  }
+
+  // Check for overly broad DATABASE_URL
+  const dbUrl = envVars.get('DATABASE_URL') || '';
+  if (dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1')) {
+    findings.push({
+      category: 'env', severity: 'info',
+      title: 'DATABASE_URL points to localhost',
+      detail: 'Using a local database. This is fine for development.',
+    });
+  }
+
+  const configuredCount = CRITICAL_ENV_VARS.filter(v => envVars.has(v) && envVars.get(v)).length
+    + RECOMMENDED_ENV_VARS.filter(v => envVars.has(v) && envVars.get(v)).length;
+
+  return {
+    findings,
+    varCount: envVars.size,
+    configured: configuredCount,
+    total: CRITICAL_ENV_VARS.length + RECOMMENDED_ENV_VARS.length,
+  };
 }
 
-function auditSettings(cwd: string): Finding[] {
-  const findings: Finding[] = []; const sp = path.join(cwd, '.claude', 'settings.local.json');
-  if (!fs.existsSync(sp)) { findings.push({ category: 'settings', severity: 'low', title: 'No settings.local.json', detail: 'Using defaults.', action: 'Create with permissions and hooks.' }); return findings; }
+function auditSettings(cwd: string): AuditFinding[] {
+  const findings: AuditFinding[] = [];
+  const settingsPath = join(cwd, '.claude', 'settings.local.json');
+
+  if (!existsSync(settingsPath)) {
+    findings.push({
+      category: 'settings', severity: 'low',
+      title: 'No settings.local.json',
+      detail: 'Custom Claude Code settings not configured. Using defaults.',
+      action: 'Create .claude/settings.local.json with permissions and hooks for your workflow.',
+    });
+    return findings;
+  }
+
   try {
-    const s = JSON.parse(fs.readFileSync(sp, 'utf-8'));
-    const allow = s.permissions?.allow || []; const deny = s.permissions?.deny || [];
-    if (allow.length === 0) findings.push({ category: 'settings', severity: 'medium', title: 'No bash permissions', detail: 'Prompted for every command.', action: 'Add common commands to allow.' });
-    for (const d of ['rm -rf', 'git push --force', 'git reset --hard']) { if (allow.some((a: string) => a.includes(d))) findings.push({ category: 'settings', severity: 'high', title: `Dangerous: "${d}" allowed`, detail: 'Risks irreversible damage.', action: `Move to deny list.` }); }
-    if (deny.length === 0) findings.push({ category: 'settings', severity: 'medium', title: 'No deny list', detail: 'Prevents destructive operations.', action: 'Add dangerous commands to deny.' });
-    if (Object.keys(s.hooks || {}).length > 0) findings.push({ category: 'settings', severity: 'info', title: 'Hooks configured', detail: `${Object.keys(s.hooks).length} hook(s).` });
-  } catch (e) { findings.push({ category: 'settings', severity: 'high', title: 'Invalid settings JSON', detail: String(e), action: 'Fix JSON syntax.' }); }
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+
+    // Check permissions
+    const perms = settings.permissions || {};
+    const allowedBash = perms.allow || [];
+    const deniedBash = perms.deny || [];
+
+    if (allowedBash.length === 0) {
+      findings.push({
+        category: 'settings', severity: 'medium',
+        title: 'No bash permissions configured',
+        detail: 'Without allowed commands, you\'ll be prompted for every shell command.',
+        action: 'Add common commands to permissions.allow (git, npm, npx, etc.).',
+      });
+    }
+
+    // Check for dangerous permissions
+    const dangerous = ['rm -rf', 'git push --force', 'git reset --hard', 'DROP TABLE'];
+    for (const d of dangerous) {
+      if (allowedBash.some((a: string) => a.includes(d))) {
+        findings.push({
+          category: 'settings', severity: 'high',
+          title: `Dangerous permission: "${d}"`,
+          detail: `Allowing "${d}" in auto-approve risks irreversible damage.`,
+          action: `Move "${d}" from allow to deny list.`,
+        });
+      }
+    }
+
+    // Check deny list
+    if (deniedBash.length === 0) {
+      findings.push({
+        category: 'settings', severity: 'medium',
+        title: 'No deny list configured',
+        detail: 'A deny list prevents accidental destructive operations.',
+        action: 'Add dangerous commands to permissions.deny (rm -rf, git push --force, etc.).',
+      });
+    }
+
+    // Check hooks
+    const hooks = settings.hooks || {};
+    const hasHooks = Object.keys(hooks).length > 0;
+    if (hasHooks) {
+      findings.push({
+        category: 'settings', severity: 'info',
+        title: 'Hooks configured',
+        detail: `${Object.keys(hooks).length} hook(s) active.`,
+      });
+    }
+
+  } catch (err) {
+    findings.push({
+      category: 'settings', severity: 'high',
+      title: 'settings.local.json is invalid JSON',
+      detail: `Parse error: ${err instanceof Error ? err.message : String(err)}`,
+      action: 'Fix the JSON syntax in .claude/settings.local.json.',
+    });
+  }
+
   return findings;
 }
 
-function auditPlansAndMemory(cwd: string): { findings: Finding[]; planCount: number; memoryCount: number } {
-  const findings: Finding[] = []; let planCount = 0, memoryCount = 0;
-  const pd = path.join(cwd, '.claude', 'plans');
-  if (fs.existsSync(pd)) { try { planCount = fs.readdirSync(pd).filter(f => f.endsWith('.md')).length; } catch {} }
-  if (planCount > 20) findings.push({ category: 'plans', severity: 'low', title: `${planCount} plans — consider archiving`, detail: 'Hard to find current plan.' });
-  const md = path.join(os.homedir(), '.claude', 'projects');
-  if (fs.existsSync(md)) { try { for (const p of fs.readdirSync(md)) { const mm = path.join(md, p, 'memory'); if (fs.existsSync(mm)) { try { memoryCount += fs.readdirSync(mm).filter(f => f.endsWith('.md')).length; } catch {} } } } catch {} }
-  if (memoryCount > 50) findings.push({ category: 'memory', severity: 'low', title: `${memoryCount} memory files`, detail: 'May slow context loading.', action: 'Prune stale entries.' });
+function auditPlansAndMemory(cwd: string): { findings: AuditFinding[]; planCount: number; memoryCount: number } {
+  const findings: AuditFinding[] = [];
+  let planCount = 0;
+  let memoryCount = 0;
+
+  // Plans
+  const plansDir = join(cwd, '.claude', 'plans');
+  if (existsSync(plansDir)) {
+    try {
+      const files = readdirSync(plansDir).filter(f => f.endsWith('.md'));
+      planCount = files.length;
+      if (planCount > 20) {
+        findings.push({
+          category: 'plans', severity: 'low',
+          title: `${planCount} plan files — consider archiving old ones`,
+          detail: 'Many plan files can make it harder to find the current active plan.',
+          action: 'Archive completed plans to a plans/archive/ subdirectory.',
+        });
+      }
+    } catch { /* */ }
+  }
+
+  // Memory (user's auto-memory directory)
+  const memoryDir = join(homedir(), '.claude', 'projects');
+  if (existsSync(memoryDir)) {
+    // Count memory files across project directories
+    try {
+      for (const proj of readdirSync(memoryDir)) {
+        const memDir = join(memoryDir, proj, 'memory');
+        if (existsSync(memDir)) {
+          try {
+            memoryCount += readdirSync(memDir).filter(f => f.endsWith('.md')).length;
+          } catch { /* */ }
+        }
+      }
+    } catch { /* */ }
+  }
+
+  if (memoryCount > 50) {
+    findings.push({
+      category: 'memory', severity: 'low',
+      title: `${memoryCount} memory files across projects`,
+      detail: 'Large memory indexes may slow down context loading.',
+      action: 'Review and prune stale memory entries.',
+    });
+  }
+
   return { findings, planCount, memoryCount };
 }
 
-function auditSessions(): { findings: Finding[]; sessionCount: number } {
-  const findings: Finding[] = []; const cd = path.join(os.homedir(), '.claude', 'projects'); let cnt = 0, sz = 0;
-  if (fs.existsSync(cd)) { try { for (const p of fs.readdirSync(cd)) { try { for (const f of fs.readdirSync(path.join(cd, p))) { if (f.endsWith('.jsonl')) { cnt++; try { sz += fs.statSync(path.join(cd, p, f)).size; } catch {} } } } catch {} } } catch {} }
-  if (cnt === 0) findings.push({ category: 'sessions', severity: 'medium', title: 'No sessions found', detail: 'Token tracking needs session data.' });
-  else { findings.push({ category: 'sessions', severity: 'info', title: `${cnt} sessions (${(sz / 1048576).toFixed(1)} MB)`, detail: 'Data available.' }); if (sz > 524288000) findings.push({ category: 'sessions', severity: 'low', title: 'Sessions > 500 MB', detail: 'Consider archiving old ones.' }); }
-  return { findings, sessionCount: cnt };
+function auditSessions(): { findings: AuditFinding[]; sessionCount: number } {
+  const findings: AuditFinding[] = [];
+  const claudeDir = join(homedir(), '.claude', 'projects');
+  let sessionCount = 0;
+  let totalSize = 0;
+
+  if (existsSync(claudeDir)) {
+    try {
+      for (const project of readdirSync(claudeDir)) {
+        const pDir = join(claudeDir, project);
+        try {
+          for (const f of readdirSync(pDir)) {
+            if (f.endsWith('.jsonl')) {
+              sessionCount++;
+              try { totalSize += statSync(join(pDir, f)).size; } catch { /* */ }
+            }
+          }
+        } catch { /* */ }
+      }
+    } catch { /* */ }
+  }
+
+  if (sessionCount === 0) {
+    findings.push({
+      category: 'sessions', severity: 'medium',
+      title: 'No Claude Code sessions found',
+      detail: 'No .jsonl session files in ~/.claude/projects/. Token tracking requires session data.',
+      action: 'Use Claude Code to create sessions, then run `promptreports push` to sync.',
+    });
+  } else {
+    const sizeMB = (totalSize / (1024 * 1024)).toFixed(1);
+    findings.push({
+      category: 'sessions', severity: 'info',
+      title: `${sessionCount} session files (${sizeMB} MB)`,
+      detail: `Session data available for analysis.`,
+    });
+
+    if (totalSize > 500 * 1024 * 1024) {
+      findings.push({
+        category: 'sessions', severity: 'low',
+        title: 'Session data exceeds 500 MB',
+        detail: `${sizeMB} MB of session data. Old sessions can be archived.`,
+        action: 'Consider archiving old session .jsonl files to free disk space.',
+      });
+    }
+  }
+
+  return { findings, sessionCount };
 }
 
-function computeScore(findings: Finding[]): number {
-  let s = 100;
-  for (const f of findings) { if (f.severity === 'critical') s -= 20; else if (f.severity === 'high') s -= 10; else if (f.severity === 'medium') s -= 5; else if (f.severity === 'low') s -= 2; }
-  return Math.max(0, Math.min(100, s));
+// ─── Score Computation ──────────────────────────────────────────────────────
+
+function computeScore(findings: AuditFinding[]): number {
+  let score = 100;
+  for (const f of findings) {
+    if (f.severity === 'critical') score -= 20;
+    else if (f.severity === 'high') score -= 10;
+    else if (f.severity === 'medium') score -= 5;
+    else if (f.severity === 'low') score -= 2;
+  }
+  return Math.max(0, Math.min(100, score));
 }
 
-function genRecs(r: AuditResult): string[] {
+function generateRecommendations(result: AuditResult): string[] {
   const recs: string[] = [];
-  if (!r.overview.claudeMdExists) recs.push('Create CLAUDE.md — single most impactful improvement.');
-  if (r.overview.skillCount === 0) recs.push('Add 3-5 skills for your most repeated workflows.');
-  if (r.overview.configuredServices < 3) recs.push('Connect more services for provider cost tracking.');
-  if (r.overview.sessionCount > 0) recs.push('Run `promptreports push` to sync data to Command Center.');
-  if (r.score >= 80) recs.push('Setup is strong. Focus on tuning: LESSONS.md, edge-case skills.');
-  if (r.score < 50) recs.push('Start with critical findings — they dramatically improve effectiveness.');
+
+  if (!result.overview.claudeMdExists) {
+    recs.push('Create CLAUDE.md — this is the single most impactful improvement for Claude Code quality.');
+  }
+  if (result.overview.skillCount === 0) {
+    recs.push('Add at least 3-5 skills for your most repeated workflows (deploy, test, review, build).');
+  }
+  if (result.overview.skillCount > 0 && result.overview.skillCount < 10) {
+    recs.push('Consider adding domain-specific skills (security audit, performance check, data migration).');
+  }
+  if (result.overview.configuredServices < 3) {
+    recs.push('Connect more services to unlock provider cost tracking and unified monitoring.');
+  }
+  if (result.overview.sessionCount > 0 && result.overview.configuredServices > 0) {
+    recs.push('Run `promptreports push` regularly to keep your Command Center data fresh.');
+  }
+  if (result.score >= 80) {
+    recs.push('Your setup is strong. Focus on tuning: review LESSONS.md, add edge-case skills, and optimize context window usage.');
+  }
+  if (result.score < 50) {
+    recs.push('Start with the critical findings — fixing those alone will dramatically improve Claude Code effectiveness.');
+  }
+
   return recs;
 }
 
+// ─── Push to Platform ───────────────────────────────────────────────────────
+
 async function pushResults(result: AuditResult): Promise<boolean> {
   const url = process.env.PROMPTREPORTS_URL || 'https://www.promptreports.ai';
-  const key = process.env.PROMPTREPORTS_API_KEY;
-  if (!key) { console.log(clr('  Skipping push — PROMPTREPORTS_API_KEY not set', 'yellow')); return false; }
+  const apiKey = process.env.PROMPTREPORTS_API_KEY;
+
+  if (!apiKey) {
+    console.log(colorize('  Skipping push — PROMPTREPORTS_API_KEY not set', 'yellow'));
+    return false;
+  }
+
   try {
     const res = await fetch(`${url}/api/swarm/intelligence/audit-results`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({ type: 'claude-code-audit', ...result }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        type: 'claude-code-audit',
+        score: result.score,
+        findings: result.findings,
+        overview: result.overview,
+        recommendations: result.recommendations,
+        timestamp: result.timestamp,
+      }),
       signal: AbortSignal.timeout(15000),
     });
+
     return res.ok;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────────
+// ─── CLAUDE.md Deep Analyzer ────────────────────────────────────────────────
 
-export async function audit(args: string[]): Promise<void> {
-  const isJson = args.includes('--json');
-  const isQuiet = args.includes('--quiet');
-  const shouldPush = args.includes('--push');
-  const cwd = process.cwd();
+interface ClaudeMdBloatFinding {
+  kind: 'duplicate' | 'verbose-example' | 'outdated-ref' | 'section-redundant' | 'filler';
+  severity: 'high' | 'medium' | 'low';
+  lineNumber: number;
+  preview: string;
+  tokensSaved: number;
+  suggestion: string;
+}
 
-  const f1 = auditClaudeMd(cwd);
-  const { findings: f2, docSizes } = auditStructure(cwd);
-  const { findings: f3, skills } = auditSkills(cwd);
-  const { findings: f4, varCount, configured, total } = auditEnv(cwd);
-  const f5 = auditSettings(cwd);
-  const { findings: f6, planCount, memoryCount } = auditPlansAndMemory(cwd);
-  const { findings: f7, sessionCount } = auditSessions();
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
 
-  const allFindings = [...f1, ...f2, ...f3, ...f4, ...f5, ...f6, ...f7];
-  const score = computeScore(allFindings);
+function detectDuplicatePhrases(content: string): ClaudeMdBloatFinding[] {
+  const findings: ClaudeMdBloatFinding[] = [];
+  const lines = content.split('\n');
+  const phraseCount = new Map<string, number[]>();
 
-  const cMdPath = path.join(cwd, 'CLAUDE.md');
-  const cMdExists = fs.existsSync(cMdPath);
-  const cMdWords = cMdExists ? fs.readFileSync(cMdPath, 'utf-8').split(/\s+/).filter(Boolean).length : 0;
+  lines.forEach((line, idx) => {
+    const normalized = line.trim().replace(/\s+/g, ' ').toLowerCase();
+    if (normalized.length < 40 || normalized.startsWith('#') || normalized.startsWith('-')) return;
+    if (!phraseCount.has(normalized)) phraseCount.set(normalized, []);
+    phraseCount.get(normalized)!.push(idx);
+  });
 
-  const result: AuditResult = {
-    score, findings: allFindings,
-    overview: { claudeMdExists: cMdExists, claudeMdWords: cMdWords, skillCount: skills.length, planCount, memoryCount, envVarCount: varCount, configuredServices: configured, totalServices: total, sessionCount, settingsExists: fs.existsSync(path.join(cwd, '.claude', 'settings.local.json')), totalDocsSize: docSizes },
-    skills, recommendations: [], timestamp: new Date().toISOString(),
-  };
-  result.recommendations = genRecs(result);
+  for (const [phrase, indices] of phraseCount) {
+    if (indices.length >= 3) {
+      findings.push({
+        kind: 'duplicate',
+        severity: indices.length >= 5 ? 'high' : 'medium',
+        lineNumber: indices[0] + 1,
+        preview: phrase.slice(0, 80),
+        tokensSaved: estimateTokens(phrase) * (indices.length - 1),
+        suggestion: `This phrase appears ${indices.length}× (first at line ${indices[0] + 1}). Keep one, delete the rest.`,
+      });
+    }
+  }
+  return findings;
+}
 
-  if (isJson) { console.log(JSON.stringify(result, null, 2)); if (shouldPush) await pushResults(result); return; }
+function detectVerboseExamples(content: string): ClaudeMdBloatFinding[] {
+  const findings: ClaudeMdBloatFinding[] = [];
+  const lines = content.split('\n');
+  let inCodeBlock = false;
+  let codeStart = 0;
+  let codeLines = 0;
 
-  // Formatted output
-  const sc = score >= 80 ? 'green' : score >= 50 ? 'yellow' : 'red';
-  const sl = score >= 80 ? 'Excellent' : score >= 60 ? 'Good' : score >= 40 ? 'Needs Work' : 'Critical';
-  printBox('Claude Code Expert Audit', [
-    `Score: ${clr(`${score}/100`, sc)} ${clr(`(${sl})`, 'dim')}`, pBar(score), '',
-    `CLAUDE.md: ${cMdExists ? clr(`${cMdWords} words`, 'green') : clr('MISSING', 'red')}`,
-    `Skills: ${clr(String(skills.length), skills.length > 0 ? 'green' : 'yellow')} installed`,
-    `Plans: ${planCount} active   Memory: ${memoryCount} entries`,
-    `Env vars: ${varCount} set (${configured}/${total} services)`,
-    `Sessions: ${sessionCount} files   Settings: ${result.overview.settingsExists ? clr('configured', 'green') : clr('default', 'yellow')}`,
+  lines.forEach((line, idx) => {
+    if (line.trim().startsWith('```')) {
+      if (!inCodeBlock) { codeStart = idx; codeLines = 0; inCodeBlock = true; }
+      else {
+        if (codeLines > 30) {
+          const block = lines.slice(codeStart + 1, idx).join('\n');
+          findings.push({
+            kind: 'verbose-example',
+            severity: codeLines > 60 ? 'high' : 'medium',
+            lineNumber: codeStart + 1,
+            preview: (lines[codeStart + 1] || '').slice(0, 60),
+            tokensSaved: Math.floor(estimateTokens(block) * 0.6),
+            suggestion: `${codeLines}-line code block. Trim to 5-10 signature lines + "... (N lines elided)".`,
+          });
+        }
+        inCodeBlock = false;
+      }
+    } else if (inCodeBlock) {
+      codeLines++;
+    }
+  });
+  return findings;
+}
+
+function detectOutdatedRefs(content: string, cwd: string): ClaudeMdBloatFinding[] {
+  const findings: ClaudeMdBloatFinding[] = [];
+  const lines = content.split('\n');
+  const refRe = /(?:`|\[)([a-zA-Z0-9_.\-/]+\.(?:ts|tsx|js|jsx|md|json|prisma))(?:`|\])/g;
+
+  lines.forEach((line, idx) => {
+    let match;
+    while ((match = refRe.exec(line)) !== null) {
+      const ref = match[1];
+      if (ref.startsWith('http') || ref.includes('://')) continue;
+      if (ref.includes('*') || ref.includes('{')) continue;
+      const resolved = join(cwd, ref);
+      if (!existsSync(resolved)) {
+        findings.push({
+          kind: 'outdated-ref',
+          severity: 'high',
+          lineNumber: idx + 1,
+          preview: `→ ${ref}`,
+          tokensSaved: estimateTokens(match[0]),
+          suggestion: `File "${ref}" doesn't exist. Update or remove the reference.`,
+        });
+      }
+    }
+  });
+  return findings;
+}
+
+function detectRedundantSections(content: string, cwd: string): ClaudeMdBloatFinding[] {
+  const findings: ClaudeMdBloatFinding[] = [];
+  const claudeDir = join(cwd, '.claude');
+  if (!existsSync(claudeDir)) return findings;
+
+  const lines = content.split('\n');
+  const sectionStarts: Array<{ line: number; heading: string }> = [];
+  lines.forEach((line, idx) => {
+    const m = line.match(/^#+\s+(.+)$/);
+    if (m) sectionStarts.push({ line: idx, heading: m[1].trim().toLowerCase() });
+  });
+
+  const externalDocs = [
+    { filename: 'LESSONS.md', keywords: ['lesson', 'mistake', 'learned'] },
+    { filename: 'TECH_STACK.md', keywords: ['tech stack', 'dependencies', 'framework'] },
+    { filename: 'DESIGN_SYSTEM.md', keywords: ['design system', 'colors', 'typography', 'spacing'] },
+    { filename: 'IMPLEMENTATION_PLAN.md', keywords: ['implementation plan', 'roadmap', 'phases'] },
+    { filename: 'BACKEND_STRUCTURE.md', keywords: ['backend structure', 'api routes', 'database schema'] },
+  ];
+
+  for (const doc of externalDocs) {
+    const docPath = join(claudeDir, doc.filename);
+    if (!existsSync(docPath)) continue;
+    for (let i = 0; i < sectionStarts.length; i++) {
+      const section = sectionStarts[i];
+      if (!doc.keywords.some(k => section.heading.includes(k))) continue;
+      const nextStart = sectionStarts[i + 1]?.line ?? lines.length;
+      const sectionLen = nextStart - section.line;
+      if (sectionLen > 15) {
+        const sectionContent = lines.slice(section.line, nextStart).join('\n');
+        findings.push({
+          kind: 'section-redundant',
+          severity: 'medium',
+          lineNumber: section.line + 1,
+          preview: lines[section.line].slice(0, 60),
+          tokensSaved: Math.floor(estimateTokens(sectionContent) * 0.8),
+          suggestion: `This section (${sectionLen} lines) duplicates .claude/${doc.filename}. Replace with: "See .claude/${doc.filename}".`,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
+function detectFiller(content: string): ClaudeMdBloatFinding[] {
+  const findings: ClaudeMdBloatFinding[] = [];
+  const lines = content.split('\n');
+  const fillerPatterns = [
+    /^(please |kindly |make sure to |be sure to |remember to )/i,
+    /^(it is important to note|it should be noted|it is worth noting)/i,
+    /\b(basically|essentially|simply|just|really|actually|very|quite)\b/gi,
+  ];
+
+  let fillerLines = 0;
+  let firstLine = -1;
+  lines.forEach((line, idx) => {
+    if (fillerPatterns.some(p => p.test(line))) {
+      fillerLines++;
+      if (firstLine === -1) firstLine = idx;
+    }
+  });
+
+  if (fillerLines >= 5) {
+    findings.push({
+      kind: 'filler',
+      severity: fillerLines >= 15 ? 'medium' : 'low',
+      lineNumber: firstLine + 1,
+      preview: lines[firstLine].slice(0, 60),
+      tokensSaved: fillerLines * 2,
+      suggestion: `${fillerLines} lines contain softening words (please, basically, actually, etc.). Strip them — Claude reads direct instructions better.`,
+    });
+  }
+  return findings;
+}
+
+async function auditClaudeMdDeep(cwd: string, flags: GlobalFlags): Promise<void> {
+  const claudeMdPath = join(cwd, 'CLAUDE.md');
+  if (!existsSync(claudeMdPath)) {
+    console.log(colorize('  No CLAUDE.md found at project root. Nothing to analyze.', 'yellow'));
+    return;
+  }
+
+  const content = readFileSync(claudeMdPath, 'utf-8');
+  const originalTokens = estimateTokens(content);
+  const originalLines = content.split('\n').length;
+  const originalWords = content.split(/\s+/).filter(Boolean).length;
+
+  const findings = [
+    ...detectDuplicatePhrases(content),
+    ...detectVerboseExamples(content),
+    ...detectOutdatedRefs(content, cwd),
+    ...detectRedundantSections(content, cwd),
+    ...detectFiller(content),
+  ].sort((a, b) => b.tokensSaved - a.tokensSaved);
+
+  const totalSavings = findings.reduce((a, f) => a + f.tokensSaved, 0);
+  const projectedTokens = Math.max(500, originalTokens - totalSavings);
+  const savingsPct = originalTokens > 0 ? ((totalSavings / originalTokens) * 100).toFixed(0) : '0';
+
+  if (flags.json) {
+    console.log(JSON.stringify({
+      file: 'CLAUDE.md',
+      originalTokens, originalLines, originalWords,
+      projectedTokens, totalSavings, savingsPct,
+      findings,
+    }, null, 2));
+    return;
+  }
+
+  box('CLAUDE.md Slim-Down Analysis', [
+    `Current:   ${colorize(`${originalTokens} tokens`, 'yellow')}  (${originalLines} lines, ${originalWords} words)`,
+    `Projected: ${colorize(`${projectedTokens} tokens`, 'green')}  after applying ${findings.length} suggestions`,
+    `Savings:   ${colorize(`${totalSavings} tokens (${savingsPct}%)`, 'green')} per session`,
   ].join('\n'));
 
+  if (findings.length === 0) {
+    console.log(colorize('\n  CLAUDE.md is already tight. No bloat detected.', 'green'));
+    return;
+  }
+
+  const byKind: Record<string, ClaudeMdBloatFinding[]> = {};
+  for (const f of findings) {
+    if (!byKind[f.kind]) byKind[f.kind] = [];
+    byKind[f.kind].push(f);
+  }
+
+  const labels: Record<string, string> = {
+    'duplicate': 'Duplicated content',
+    'verbose-example': 'Long code examples',
+    'outdated-ref': 'Dead file references',
+    'section-redundant': 'Sections duplicating other docs',
+    'filler': 'Filler words',
+  };
+
+  for (const [kind, items] of Object.entries(byKind)) {
+    const kindSavings = items.reduce((a, f) => a + f.tokensSaved, 0);
+    sectionHeader(`${labels[kind] || kind} — ${items.length} finding(s), ~${kindSavings} tokens`);
+    for (const f of items.slice(0, 8)) {
+      const sev = f.severity === 'high' ? colorize('HIGH', 'red')
+        : f.severity === 'medium' ? colorize('MED', 'yellow')
+        : colorize('LOW', 'dim');
+      console.log(`  ${sev}  L${f.lineNumber}  ${colorize(f.preview, 'dim')}`);
+      console.log(`        ${f.suggestion}  ${colorize(`(~${f.tokensSaved} tokens)`, 'green')}`);
+    }
+    if (items.length > 8) {
+      console.log(colorize(`  ... and ${items.length - 8} more. Run with --json for full list.`, 'dim'));
+    }
+    console.log('');
+  }
+
+  sectionHeader('Next Steps');
+  console.log('  1. Review highest-impact findings above (sorted by token savings)');
+  console.log('  2. Apply changes to CLAUDE.md');
+  console.log(`  3. Re-run: ${colorize('promptreports audit claude-md', 'cyan')} to verify`);
+  console.log(`  4. Savings apply to ${colorize('every Claude Code session', 'bold')} in this project`);
+  console.log('');
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+export async function auditCommand(flags: GlobalFlags): Promise<void> {
+  const cwd = process.cwd();
+
+  if (flags.args[0] === 'claude-md') {
+    await auditClaudeMdDeep(cwd, flags);
+    return;
+  }
+
+  const shouldPush = flags.args.includes('--push');
+
+  // Run all auditors
+  const claudeMdFindings = auditClaudeMd(cwd);
+  const { findings: structureFindings, docSizes } = auditStructure(cwd);
+  const { findings: skillFindings, skills } = auditSkills(cwd);
+  const { findings: envFindings, varCount, configured, total } = auditEnv(cwd);
+  const settingsFindings = auditSettings(cwd);
+  const { findings: planFindings, planCount, memoryCount } = auditPlansAndMemory(cwd);
+  const { findings: sessionFindings, sessionCount } = auditSessions();
+
+  const allFindings = [
+    ...claudeMdFindings, ...structureFindings, ...skillFindings,
+    ...envFindings, ...settingsFindings, ...planFindings, ...sessionFindings,
+  ];
+
+  const score = computeScore(allFindings);
+
+  const result: AuditResult = {
+    score,
+    findings: allFindings,
+    overview: {
+      claudeMdExists: existsSync(join(cwd, 'CLAUDE.md')),
+      claudeMdWords: existsSync(join(cwd, 'CLAUDE.md'))
+        ? readFileSync(join(cwd, 'CLAUDE.md'), 'utf-8').split(/\s+/).filter(Boolean).length : 0,
+      skillCount: skills.length,
+      planCount,
+      memoryCount,
+      envVarCount: varCount,
+      configuredServices: configured,
+      totalServices: total,
+      sessionCount,
+      settingsExists: existsSync(join(cwd, '.claude', 'settings.local.json')),
+      totalDocsSize: docSizes,
+    },
+    skills,
+    recommendations: [],
+    timestamp: new Date().toISOString(),
+  };
+
+  result.recommendations = generateRecommendations(result);
+
+  // ─── JSON Output ────────────────────────────────────────────────────────
+  if (flags.json) {
+    console.log(JSON.stringify(result, null, 2));
+    if (shouldPush) await pushResults(result);
+    return;
+  }
+
+  // ─── Formatted Output ───────────────────────────────────────────────────
+
+  // Score box
+  const scoreColor: 'green' | 'yellow' | 'red' = score >= 80 ? 'green' : score >= 50 ? 'yellow' : 'red';
+  const scoreLabel = score >= 80 ? 'Excellent' : score >= 60 ? 'Good' : score >= 40 ? 'Needs Work' : 'Critical';
+  box('Claude Code Expert Audit', [
+    `Score: ${colorize(`${score}/100`, scoreColor)} ${colorize(`(${scoreLabel})`, 'dim')}`,
+    progressBar(score),
+    '',
+    `CLAUDE.md: ${result.overview.claudeMdExists ? colorize(`${result.overview.claudeMdWords} words`, 'green') : colorize('MISSING', 'red')}`,
+    `Skills: ${colorize(`${result.overview.skillCount}`, result.overview.skillCount > 0 ? 'green' : 'yellow')} installed`,
+    `Plans: ${result.overview.planCount} active   Memory: ${result.overview.memoryCount} entries`,
+    `Env vars: ${result.overview.envVarCount} set (${result.overview.configuredServices}/${result.overview.totalServices} services)`,
+    `Sessions: ${result.overview.sessionCount} files   Settings: ${result.overview.settingsExists ? colorize('configured', 'green') : colorize('default', 'yellow')}`,
+  ].join('\n'));
+
+  // Findings by severity
   const critical = allFindings.filter(f => f.severity === 'critical');
   const high = allFindings.filter(f => f.severity === 'high');
   const medium = allFindings.filter(f => f.severity === 'medium');
   const low = allFindings.filter(f => f.severity === 'low');
   const info = allFindings.filter(f => f.severity === 'info');
 
-  if (critical.length > 0) { printSection(`CRITICAL (${critical.length})`); for (const f of critical) { console.log(`  ${clr('\u2717', 'red')}  ${clr(f.title, 'red')}\n     ${clr(f.detail, 'dim')}`); if (f.action) console.log(`     ${clr('Action:', 'yellow')} ${f.action}`); console.log(''); } }
-  if (high.length > 0) { printSection(`HIGH (${high.length})`); for (const f of high) { console.log(`  ${clr('!', 'yellow')}  ${clr(f.title, 'yellow')}\n     ${clr(f.detail, 'dim')}`); if (f.action) console.log(`     ${clr('Action:', 'yellow')} ${f.action}`); console.log(''); } }
-  if (medium.length > 0) { printSection(`MEDIUM (${medium.length})`); for (const f of medium) { console.log(`  ${clr('\u25CF', 'blue')}  ${f.title}\n     ${clr(f.detail, 'dim')}`); if (f.action) console.log(`     ${clr('Action:', 'cyan')} ${f.action}`); console.log(''); } }
-  if ((low.length + info.length > 0) && !isQuiet) { printSection(`LOW & INFO (${low.length + info.length})`); for (const f of [...low, ...info]) { console.log(`  ${clr(f.severity === 'info' ? '\u2139' : '\u25CB', 'dim')}  ${clr(f.title, 'dim')} — ${clr(f.detail, 'dim')}`); } console.log(''); }
-
-  if (skills.length > 0 && !isQuiet) {
-    printSection('Skills Overview');
-    printTable(['Skill', 'Lines', 'Invocable', 'Refs', 'Triggers'], skills.sort((a, b) => b.lines - a.lines).slice(0, 10).map(s => [
-      s.name, String(s.lines), s.isUserInvocable ? clr('yes', 'green') : clr('no', 'dim'), s.hasReferences ? clr('yes', 'green') : clr('no', 'dim'), s.hasTriggers ? clr('yes', 'green') : clr('no', 'dim'),
-    ]));
+  if (critical.length > 0) {
+    sectionHeader(`CRITICAL (${critical.length})`);
+    for (const f of critical) {
+      console.log(`  ${colorize('\u2717', 'red')}  ${colorize(f.title, 'red')}`);
+      console.log(`     ${colorize(f.detail, 'dim')}`);
+      if (f.action) console.log(`     ${colorize('Action:', 'yellow')} ${f.action}`);
+      console.log('');
+    }
   }
 
-  if (result.recommendations.length > 0) { printSection('Expert Recommendations'); for (const r of result.recommendations) console.log(`  ${clr('\u2192', 'cyan')}  ${r}`); console.log(''); }
+  if (high.length > 0) {
+    sectionHeader(`HIGH (${high.length})`);
+    for (const f of high) {
+      console.log(`  ${colorize('!', 'yellow')}  ${colorize(f.title, 'yellow')}`);
+      console.log(`     ${colorize(f.detail, 'dim')}`);
+      if (f.action) console.log(`     ${colorize('Action:', 'yellow')} ${f.action}`);
+      console.log('');
+    }
+  }
 
-  const actionable = allFindings.filter(f => f.action && f.severity !== 'info');
-  if (actionable.length > 0) {
-    printSection(`Actions Needed (${actionable.length})`);
-    for (let i = 0; i < Math.min(actionable.length, 10); i++) { const f = actionable[i]; const sv = f.severity === 'critical' ? clr('[CRITICAL]', 'red') : f.severity === 'high' ? clr('[HIGH]', 'yellow') : clr(`[${f.severity.toUpperCase()}]`, 'dim'); console.log(`  ${i + 1}. ${sv} ${f.action}`); }
-    if (actionable.length > 10) console.log(clr(`\n  ... and ${actionable.length - 10} more. Use --json for full list.`, 'dim'));
+  if (medium.length > 0) {
+    sectionHeader(`MEDIUM (${medium.length})`);
+    for (const f of medium) {
+      console.log(`  ${colorize('\u25CF', 'blue')}  ${f.title}`);
+      console.log(`     ${colorize(f.detail, 'dim')}`);
+      if (f.action) console.log(`     ${colorize('Action:', 'cyan')} ${f.action}`);
+      console.log('');
+    }
+  }
+
+  if (low.length + info.length > 0 && !flags.quiet) {
+    sectionHeader(`LOW & INFO (${low.length + info.length})`);
+    for (const f of [...low, ...info]) {
+      const icon = f.severity === 'info' ? colorize('\u2139', 'dim') : colorize('\u25CB', 'dim');
+      console.log(`  ${icon}  ${colorize(f.title, 'dim')} — ${colorize(f.detail, 'dim')}`);
+    }
     console.log('');
   }
 
+  // Skills overview
+  if (skills.length > 0 && !flags.quiet) {
+    sectionHeader('Skills Overview');
+    const topSkills = skills.sort((a, b) => b.lines - a.lines).slice(0, 10);
+    table(
+      ['Skill', 'Lines', 'Invocable', 'Refs', 'Triggers'],
+      topSkills.map(s => [
+        s.name,
+        `${s.lines}`,
+        s.isUserInvocable ? colorize('yes', 'green') : colorize('no', 'dim'),
+        s.hasReferences ? colorize('yes', 'green') : colorize('no', 'dim'),
+        s.hasTriggers ? colorize('yes', 'green') : colorize('no', 'dim'),
+      ]),
+    );
+  }
+
+  // Recommendations
+  if (result.recommendations.length > 0) {
+    sectionHeader('Expert Recommendations');
+    for (const rec of result.recommendations) {
+      console.log(`  ${colorize('\u2192', 'cyan')}  ${rec}`);
+    }
+    console.log('');
+  }
+
+  // Actions summary
+  const actionable = allFindings.filter(f => f.action && f.severity !== 'info');
+  if (actionable.length > 0) {
+    sectionHeader(`Actions Needed (${actionable.length})`);
+    for (let i = 0; i < Math.min(actionable.length, 10); i++) {
+      const f = actionable[i];
+      const sev = f.severity === 'critical' ? colorize('[CRITICAL]', 'red')
+        : f.severity === 'high' ? colorize('[HIGH]', 'yellow')
+        : colorize(`[${f.severity.toUpperCase()}]`, 'dim');
+      console.log(`  ${i + 1}. ${sev} ${f.action}`);
+    }
+    if (actionable.length > 10) {
+      console.log(colorize(`\n  ... and ${actionable.length - 10} more actions. Run with --json for full list.`, 'dim'));
+    }
+    console.log('');
+  }
+
+  // Push
   if (shouldPush) {
     const ok = await pushResults(result);
-    console.log(ok ? clr('  \u2713 Results pushed to Command Center', 'green') : clr('  \u2717 Push failed — check API key and URL', 'red'));
+    console.log(ok
+      ? colorize('  \u2713 Results pushed to Command Center', 'green')
+      : colorize('  \u2717 Push failed — check API key and URL', 'red'));
     console.log('');
   }
 }
