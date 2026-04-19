@@ -7,7 +7,9 @@ Vibe coding intelligence — unified ops, cost tracking, environment sync, and d
 ```bash
 npx promptreports-cli
 ```
-More Info promptreports.ai
+More Info https://www.promptreports.ai/
+
+Vibe Coder Toolkit - https://www.promptreports.ai/vibe-coder-toolkit
 
 ## What's new in 1.2.0
 
