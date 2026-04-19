@@ -7,6 +7,7 @@ Vibe coding intelligence — unified ops, cost tracking, environment sync, and d
 ```bash
 npx promptreports-cli
 ```
+More Info promptreports.ai
 
 ## What's new in 1.2.0
 
