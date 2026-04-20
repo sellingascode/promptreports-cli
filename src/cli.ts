@@ -25,6 +25,7 @@ import { modelsCommand } from './commands/models';
 import { gitIntelCommand } from './commands/git-intel';
 import { auditCommand } from './commands/audit';
 import { filterCommand } from './commands/filter';
+import { campaignCommand } from './commands/campaign';
 import { colorize } from './utils/format';
 
 // ─── Global Flags ───────────────────────────────────────────────────────────
@@ -80,7 +81,7 @@ function parseGlobalFlags(argv: string[]): { command: string; subcommand: string
 
 function printHelp(): void {
   console.log('');
-  console.log(colorize('  promptreports-cli', 'bold') + colorize(' v1.2.1', 'dim'));
+  console.log(colorize('  promptreports-cli', 'bold') + colorize(' v1.2.4', 'dim'));
   console.log(colorize('  Vibe coding intelligence for developers', 'dim'));
   console.log('');
   console.log(colorize('  CORE', 'bold'));
@@ -91,6 +92,7 @@ function printHelp(): void {
   console.log('    audit                Claude Code expert audit (.claude, skills, env)');
   console.log('    audit claude-md      Deep CLAUDE.md slim-down analysis (NEW)');
   console.log('    filter -- <cmd>      Compress subprocess output before your agent reads it (NEW)');
+  console.log('    campaign             Launch & inspect demand-gen campaigns (launch|list|show)');
   console.log('');
   console.log(colorize('  ENVIRONMENT & SETUP', 'bold'));
   console.log('    env sync             Sync .env.local with Vercel/Railway');
@@ -129,6 +131,7 @@ function printHelp(): void {
   console.log('    promptreports health                     # Post-deploy check');
   console.log('    promptreports costs --by model           # Cost by AI model');
   console.log('    promptreports costs --by commit          # Cost per git commit');
+  console.log('    promptreports costs --push-to-app        # Push correlated payload to Token Forensics');
   console.log('    promptreports context                    # Context window analysis');
   console.log('    promptreports models                     # Model optimization tips');
   console.log('    promptreports prompts audit              # Prompt drift scan');
@@ -153,6 +156,10 @@ function printHelp(): void {
   console.log('    promptreports context --ghosts           # Find silent token waste');
   console.log('    promptreports filter -- npm test         # Compress noisy test output');
   console.log('    promptreports filter -- playwright test  # Dedupe stack frames, truncate blocks');
+  console.log('    promptreports campaign launch "V2 export flow"   # Launch a campaign');
+  console.log('    promptreports campaign launch npm:my-package     # Trigger from npm release');
+  console.log('    promptreports campaign list              # List your campaigns');
+  console.log('    promptreports campaign show <id>         # Show one campaign');
   console.log('    promptreports push --dry-run             # Preview push');
   console.log('');
 }
@@ -170,6 +177,7 @@ async function main(): Promise<void> {
       case 'doctor':      await doctorCommand(flags); break;
       case 'audit':       await auditCommand(flags); break;
       case 'filter':      await filterCommand(flags); break;
+      case 'campaign':    await campaignCommand(flags); break;
       case 'env':         await envSyncCommand(flags); break;
       case 'logs':        await logsCommand(flags); break;
       case 'health':      await healthCommand(flags); break;

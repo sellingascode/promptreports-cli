@@ -7,6 +7,7 @@
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,21 @@ export interface TurnRecord {
   costUsd: number;
   sessionId: string;
   efficiencyScore: number;
+  /** Cross-system correlation — populated when buildPayload() is called with commit data. */
+  gitCommitHash?: string;
+  gitCommitMessage?: string;
+  gitCommitAuthor?: string;
+  gitCommitDate?: string;
+  openrouterRequestId?: string;
+}
+
+export interface GitCommitInfo {
+  hash: string;
+  date: string;
+  subject: string;
+  author: string;
+  /** Epoch ms — precomputed so we don't re-parse on every turn. */
+  timeMs: number;
 }
 
 export interface SessionStats {
@@ -99,6 +115,10 @@ export interface PlatformPayload {
     model: string;
     estimatedCostUsd: number;
     cacheHitRate: number;
+    gitCommitHash?: string;
+    gitCommitMessage?: string;
+    openrouterRequestCount?: number;
+    modelMix?: Record<string, number>;
   }>;
   turns: TurnRecord[];
   suggestions: string[];
@@ -109,6 +129,20 @@ export interface PlatformPayload {
     opusPercent: number;
     longSessions: number;
   };
+  commits?: Array<{
+    hash: string;
+    message: string;
+    date: string;
+    author: string;
+    filesChanged: number;
+    linesAdded: number;
+    linesRemoved: number;
+    turns: number;
+    tokens: number;
+    costUsd: number;
+    avgCostPerTurn: number;
+    efficiency: number;
+  }>;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -322,7 +356,55 @@ export function analyzeSession(entries: MessageEntry[], days: number = 7): Sessi
 }
 
 /**
+ * Load git commits for the current repo within a time window.
+ * Returns [] outside a git repo or on any execSync failure — never throws.
+ */
+export function loadGitCommits(days: number): GitCommitInfo[] {
+  try {
+    const log = execSync(`git log --format="%H|%aI|%s|%an" --since="${days} days ago"`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    return log.trim().split('\n').filter(Boolean).map(line => {
+      const [hash, date, subject, author] = line.split('|');
+      return {
+        hash: hash || '',
+        date: date || '',
+        subject: subject || '',
+        author: author || '',
+        timeMs: date ? new Date(date).getTime() : 0,
+      };
+    }).filter(c => c.hash && c.timeMs > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Pick the commit whose timestamp lies within `windowMs` of `turnTimeMs` and is
+ * closest to it. Prefers commits *after* the turn (likely caused by it); falls
+ * back to the most recent prior commit. Returns null if nothing is in range.
+ */
+export function correlateCommit(turnTimeMs: number, commits: GitCommitInfo[], windowMs = 3600000): GitCommitInfo | null {
+  if (!commits.length || !turnTimeMs) return null;
+  let best: GitCommitInfo | null = null;
+  let bestDist = Infinity;
+  for (const c of commits) {
+    const dist = Math.abs(c.timeMs - turnTimeMs);
+    if (dist <= windowMs && dist < bestDist) {
+      best = c;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+/**
  * Build a PlatformPayload from analyzed session stats.
+ *
+ * When the CWD is a git repo, each turn is stitched to the nearest commit
+ * within ±1h so the platform can render git → session → request → cost traces
+ * (see TOKEN_FORENSICS_MOCKUP.html). Non-repo environments silently skip this.
  */
 export function buildPayload(stats: SessionStats[], days: number): PlatformPayload {
   const t = stats.reduce((a, s) => ({
@@ -340,11 +422,54 @@ export function buildPayload(stats: SessionStats[], days: number): PlatformPaylo
   const opusSessions = stats.filter(s => s.model.includes('opus'));
   const cwPct = total > 0 ? (t.cw / total * 100) : 0;
 
+  // Git correlation — load once, re-use across every turn and session.
+  const commits = loadGitCommits(days);
+
   const allTurns: TurnRecord[] = [];
   for (const s of stats) {
     for (const turn of s.turns) {
-      allTurns.push({ ...turn, model: turn.model || s.model });
+      const turnTime = turn.timestamp ? new Date(turn.timestamp).getTime() : 0;
+      const commit = correlateCommit(turnTime, commits);
+      allTurns.push({
+        ...turn,
+        model: turn.model || s.model,
+        ...(commit && {
+          gitCommitHash: commit.hash,
+          gitCommitMessage: commit.subject,
+          gitCommitAuthor: commit.author,
+          gitCommitDate: commit.date,
+        }),
+      });
     }
+  }
+
+  // Per-commit rollup so the platform can render a traces panel without
+  // re-scanning all turns on every GET.
+  const commitRollup = new Map<string, { hash: string; message: string; date: string; author: string; turns: number; tokens: number; costUsd: number }>();
+  for (const turn of allTurns) {
+    if (!turn.gitCommitHash) continue;
+    const k = turn.gitCommitHash;
+    let entry = commitRollup.get(k);
+    if (!entry) {
+      entry = { hash: k, message: turn.gitCommitMessage || '', date: turn.gitCommitDate || '', author: turn.gitCommitAuthor || '', turns: 0, tokens: 0, costUsd: 0 };
+      commitRollup.set(k, entry);
+    }
+    entry.turns += 1;
+    entry.tokens += turn.totalTokens;
+    entry.costUsd += turn.costUsd;
+  }
+
+  // Per-session commit + model-mix rollup so the traces tab can render chain rows.
+  const sessionCommitMap = new Map<string, string>();
+  const sessionModelMix = new Map<string, Record<string, number>>();
+  for (const turn of allTurns) {
+    if (turn.gitCommitHash && !sessionCommitMap.has(turn.sessionId)) {
+      sessionCommitMap.set(turn.sessionId, turn.gitCommitHash);
+    }
+    const mix = sessionModelMix.get(turn.sessionId) || {};
+    const key = normalizeModelName(turn.model);
+    mix[key] = (mix[key] || 0) + 1;
+    sessionModelMix.set(turn.sessionId, mix);
   }
 
   return {
@@ -362,16 +487,26 @@ export function buildPayload(stats: SessionStats[], days: number): PlatformPaylo
       cacheHitRate,
       estimatedCostUsd: t.cost,
     },
-    sessions: stats.map(s => ({
-      sessionId: s.sessionId,
-      startedAt: s.startedAt,
-      endedAt: s.endedAt,
-      messageCount: s.messageCount,
-      totalTokens: s.totalTokens,
-      model: s.model,
-      estimatedCostUsd: s.estimatedCostUsd,
-      cacheHitRate: s.cacheHitRate,
-    })),
+    sessions: stats.map(s => {
+      const commitHash = sessionCommitMap.get(s.sessionId);
+      const commit = commitHash ? commitRollup.get(commitHash) : undefined;
+      return {
+        sessionId: s.sessionId,
+        startedAt: s.startedAt,
+        endedAt: s.endedAt,
+        messageCount: s.messageCount,
+        totalTokens: s.totalTokens,
+        model: s.model,
+        estimatedCostUsd: s.estimatedCostUsd,
+        cacheHitRate: s.cacheHitRate,
+        openrouterRequestCount: s.turns.length,
+        modelMix: sessionModelMix.get(s.sessionId) || {},
+        ...(commit && {
+          gitCommitHash: commit.hash,
+          gitCommitMessage: commit.message,
+        }),
+      };
+    }),
     turns: allTurns,
     suggestions: generateSuggestions(stats),
     patterns: {
@@ -381,7 +516,29 @@ export function buildPayload(stats: SessionStats[], days: number): PlatformPaylo
       opusPercent: stats.length > 0 ? (opusSessions.length / stats.length) * 100 : 0,
       longSessions: stats.filter(s => s.messageCount > 30).length,
     },
+    commits: [...commitRollup.values()].map(c => ({
+      hash: c.hash,
+      message: c.message,
+      date: c.date,
+      author: c.author,
+      filesChanged: 0,
+      linesAdded: 0,
+      linesRemoved: 0,
+      turns: c.turns,
+      tokens: c.tokens,
+      costUsd: c.costUsd,
+      avgCostPerTurn: c.turns > 0 ? c.costUsd / c.turns : 0,
+      efficiency: 0,
+    })),
   };
+}
+
+function normalizeModelName(model: string): string {
+  const m = (model || '').toLowerCase();
+  if (m.includes('opus')) return 'opus';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('haiku')) return 'haiku';
+  return m || 'unknown';
 }
 
 /**
